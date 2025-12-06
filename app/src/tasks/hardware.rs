@@ -1,117 +1,50 @@
-use std::sync::mpsc::TryRecvError;
-use std::thread;
-use std::time::Duration;
+use std::sync::mpsc::channel;
+use std::sync::{Arc, Mutex};
 
-use atom_echo_hw::{ButtonState, Device, LedState};
-use heapless::{String as HString, Vec as HVec};
-use log::{debug, warn};
-use rtp_audio::{decode_ulaw, JitterBuffer, RtpPacket};
+use atom_echo_hw::Device;
+use log::info;
 
-use crate::messages::{AudioCommand, AudioCommandReceiver, SipCommand, SipCommandSender};
+use crate::messages::{
+    AudioCommandReceiver, AudioControlReceiver, AudioControlSender, SipCommandSender,
+    UiCommandReceiver, UiCommandSender,
+};
+use crate::tasks::{audio, ui, wifi};
 
-const FRAME_SAMPLES: usize = 160;
-
-pub fn spawn_hardware_task(
-    mut device: Device,
-    sip_tx: SipCommandSender,
-    audio_rx: AudioCommandReceiver,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        hardware_loop(&mut device, sip_tx, audio_rx);
-    })
+pub struct HardwareHandles {
+    pub audio: std::thread::JoinHandle<()>,
+    pub ui: std::thread::JoinHandle<()>,
+    pub wifi: std::thread::JoinHandle<()>,
 }
 
-fn hardware_loop(
-    device: &mut Device,
+pub fn spawn_hardware_tasks(
+    device: Device,
     sip_tx: SipCommandSender,
     audio_rx: AudioCommandReceiver,
-) {
-    let mut jitter: JitterBuffer<8, FRAME_SAMPLES> = JitterBuffer::new();
-    let mut last_button = device.read_button_state();
-    let mut remote_rtp: Option<(HString<48>, u16)> = None;
+) -> HardwareHandles {
+    let device = Arc::new(Mutex::new(device));
 
-    loop {
-        // Handle messages from SIP.
-        loop {
-            match audio_rx.try_recv() {
-                Ok(cmd) => match cmd {
-                    AudioCommand::DialogStateChanged(state) => {
-                        let led = match state {
-                            sip_core::DialogState::Idle => LedState::Color {
-                                red: 0,
-                                green: 32,
-                                blue: 0,
-                            },
-                            sip_core::DialogState::Inviting | sip_core::DialogState::Ringing => {
-                                LedState::Color {
-                                    red: 32,
-                                    green: 32,
-                                    blue: 0,
-                                }
-                            }
-                            sip_core::DialogState::Established => LedState::Color {
-                                red: 0,
-                                green: 0,
-                                blue: 48,
-                            },
-                            sip_core::DialogState::Terminated => LedState::Off,
-                        };
-                        let _ = device.set_led_state(led);
-                    }
-                    AudioCommand::SetRemoteRtpEndpoint { ip, port } => {
-                        remote_rtp = Some((ip, port));
-                        debug!("remote RTP endpoint set");
-                    }
-                    AudioCommand::IncomingRtpPacket(bytes) => {
-                        if let Ok(pkt) = RtpPacket::<512>::unpack(&bytes) {
-                            let decoded = decode_ulaw(&pkt.payload);
-                            jitter.push_frame(pkt.header.sequence_number, &decoded);
-                        }
-                    }
-                    AudioCommand::SetLed(state) => {
-                        let _ = device.set_led_state(state);
-                    }
-                },
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    warn!("audio channel closed; hardware task exiting");
-                    return;
-                }
-            }
-        }
+    let (ui_tx, ui_rx): (UiCommandSender, UiCommandReceiver) = channel();
+    let (audio_ctrl_tx, audio_ctrl_rx): (AudioControlSender, AudioControlReceiver) = channel();
 
-        // Button polling (simple edge detection).
-        let btn = device.read_button_state();
-        if btn != last_button {
-            last_button = btn;
-            let event = match btn {
-                ButtonState::Pressed => SipCommand::PttPressed,
-                ButtonState::Released => SipCommand::PttReleased,
-            };
-            let _ = sip_tx.send(event);
-        }
+    info!("spawning audio task");
+    let audio_handle = audio::spawn_audio_task(
+        Arc::clone(&device),
+        sip_tx.clone(),
+        audio_rx,
+        audio_ctrl_rx,
+        ui_tx.clone(),
+    );
 
-        // Playback path: drain jitter buffer (silence if empty).
-        let (frame, _had_audio) = jitter.pop_frame();
-        let _ = device.write_speaker_frame(&frame);
+    info!("spawning UI task");
+    let ui_handle =
+        ui::spawn_ui_task(Arc::clone(&device), sip_tx, ui_rx, audio_ctrl_tx);
 
-        // Capture path: always send a frame when PTT is pressed and we have a remote endpoint.
-        if last_button == ButtonState::Pressed && remote_rtp.is_some() {
-            let mut mic_buf = [0_i16; FRAME_SAMPLES];
-            match device.read_mic_frame(&mut mic_buf) {
-                Ok(count) => {
-                    let mut vec: HVec<i16, FRAME_SAMPLES> = HVec::new();
-                    for sample in mic_buf.iter().copied().take(count) {
-                        let _ = vec.push(sample);
-                    }
-                    let _ = sip_tx.send(SipCommand::OutgoingPcmFrame(vec));
-                }
-                Err(err) => {
-                    warn!("mic read error: {:?}", err);
-                }
-            }
-        }
+    info!("spawning Wi-Fi task");
+    let wifi_handle = wifi::spawn_wifi_task();
 
-        thread::sleep(Duration::from_millis(10));
+    HardwareHandles {
+        audio: audio_handle,
+        ui: ui_handle,
+        wifi: wifi_handle,
     }
 }
