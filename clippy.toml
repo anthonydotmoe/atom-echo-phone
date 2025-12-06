@@ -1,0 +1,2 @@
+warn = ["clippy::all"]
+msrv = "1.77"

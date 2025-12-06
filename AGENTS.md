@@ -1,5 +1,11 @@
 # AGENTS.md
 
+## IMPORTANT
+
+You must call `. $HOME/export-esp.sh` in any new shell context or building will
+fail. The builder requires certain environment variables to be set. It is safe
+to run it if you are unsure if it has been ran already.
+
 ## Purpose of this repository
 
 This repo is for building a tiny SIP “phone” on an M5Stack Atom Echo (ESP32-PICO-D4) using **Rust on top of ESP-IDF**.
