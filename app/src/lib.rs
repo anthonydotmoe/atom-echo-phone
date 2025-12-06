@@ -34,7 +34,7 @@ pub fn run() -> Result<(), AppError> {
     jitter.push_frame(0, &[0; 160]);
     let _ = jitter.pop_frame();
 
-    let _ = atom_echo_hw::set_led_state(&mut audio, LedState {
+    let _ = atom_echo_hw::set_led_state(&mut audio, LedState::Color {
         red: 0,
         green: 255,
         blue: 0,
