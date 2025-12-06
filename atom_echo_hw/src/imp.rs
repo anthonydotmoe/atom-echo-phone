@@ -17,7 +17,7 @@ mod esp {
     /// are implemented.
     pub struct DeviceInner {
         wifi: EspWifi<'static>,
-        i2s: I2sDriver<I2sBiDir>,
+        i2s: I2sDriver<'static, I2sBiDir>,
         // TODO: add button GPIO and LED driver fields here.
     }
 
@@ -179,3 +179,9 @@ mod host {
 pub use esp::DeviceInner;
 #[cfg(not(target_os = "espidf"))]
 pub use host::DeviceInner;
+
+#[cfg(target_os = "espidf")]
+pub use esp::init_device;
+#[cfg(not(target_os = "espidf"))]
+pub use host::init_device;
+
