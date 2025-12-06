@@ -28,12 +28,10 @@ pub fn run() -> Result<(), AppError> {
         .map_err(|err| AppError::Sip(err.to_string()))?;
     sip.on_register_response(200);
 
-    let _local_sdp =
-        SessionDescription::offer("atom-echo", "0.0.0.0", 10_000).map_err(|err| {
-            AppError::Sip(format!("sdp render: {err}"))
-        })?;
-    let mut jitter = JitterBuffer::new(4);
-    jitter.push_frame(vec![0; 160]);
+    let _local_sdp = SessionDescription::offer("atom-echo", "0.0.0.0", 10_000)
+        .map_err(|err| AppError::Sip(format!("sdp render: {err}")))?;
+    let mut jitter: JitterBuffer<4, 160> = JitterBuffer::new();
+    jitter.push_frame(0, &[0; 160]);
     let _ = jitter.pop_frame();
 
     let _ = atom_echo_hw::set_led_state(&mut audio, LedState {
