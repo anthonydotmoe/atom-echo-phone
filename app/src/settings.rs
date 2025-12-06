@@ -10,6 +10,10 @@ pub struct Settings {
     pub sip_registrar: &'static str,
     #[default("sip:user@example.com")]
     pub sip_contact: &'static str,
+    #[default("user")]
+    pub sip_username: &'static str,
+    #[default("pass")]
+    pub sip_password: &'static str,
     #[default("sip:100@example.com")]
     pub sip_target: &'static str,
 }

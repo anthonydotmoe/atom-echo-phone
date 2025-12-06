@@ -1,5 +1,5 @@
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use std::net::UdpSocket;
 
@@ -8,7 +8,10 @@ use log::{debug, warn};
 
 use rtp_audio::{encode_ulaw, RtpHeader, RtpPacket};
 use sdp::SessionDescription;
-use sip_core::{DialogState, SipStack};
+use sip_core::{
+    authorization_header, DigestCredentials, DialogState, RegistrationResult, RegistrationState,
+    SipStack,
+};
 
 use crate::messages::{AudioCommand, AudioCommandSender, SipCommand, SipCommandReceiver};
 
@@ -38,6 +41,12 @@ fn sip_loop(
     sip_socket
         .set_nonblocking(true)
         .expect("set nonblocking");
+    let registrar_addr = registrar.parse::<std::net::SocketAddr>().ok();
+    if let Some(addr) = registrar_addr {
+        let _ = sip_socket.connect(addr);
+    }
+    let (local_ip, local_sip_port) = local_ip_port(&sip_socket);
+    let contact_uri = build_contact_uri(settings.sip_contact, &local_ip, local_sip_port);
 
     let rtp_socket = UdpSocket::bind("0.0.0.0:0").expect("create RTP socket");
     local_rtp_port = rtp_socket
@@ -45,30 +54,91 @@ fn sip_loop(
         .map(|addr| addr.port())
         .unwrap_or(10_000);
 
-    // Stub registration
-    if let Ok(req) = sip.register(settings.sip_contact, settings.sip_contact) {
-        let rendered = req.render().ok();
-        if let Some(body) = &rendered {
-            debug!("sending REGISTER:\n{}", body);
-        }
-        send_sip(&sip_socket, &registrar, &req.render().unwrap());
-        // assume success for now
-        sip.on_register_response(200);
-    }
+    let mut next_register = Instant::now();
+    let mut last_reg_state = RegistrationState::Unregistered;
+    let mut pending_auth = None;
 
     loop {
+        let now = Instant::now();
+
+        if now >= next_register && sip.registration.state() != RegistrationState::Registering {
+            let expires = if sip.registration.state() == RegistrationState::Registered {
+                sip.registration.last_expires()
+            } else {
+                3600
+            };
+
+            let auth_header = pending_auth.take().and_then(|challenge| {
+                let creds = DigestCredentials {
+                    username: settings.sip_username,
+                    password: settings.sip_password,
+                };
+                authorization_header(&challenge, &creds, "REGISTER", settings.sip_registrar).ok()
+            });
+
+            match sip.register(
+                settings.sip_registrar,
+                &contact_uri,
+                &local_ip,
+                local_sip_port,
+                expires,
+                auth_header,
+            ) {
+                Ok(req) => {
+                    if let Ok(rendered) = req.render() {
+                        debug!("sending REGISTER:\n{}", rendered);
+                        send_sip(&sip_socket, &registrar, &rendered);
+                        next_register = now + Duration::from_secs(5);
+                    }
+                }
+                Err(err) => {
+                    warn!("failed to build REGISTER: {:?}", err);
+                    next_register = now + Duration::from_secs(30);
+                }
+            }
+        }
+
         // Handle inbound SIP packets
         let mut buf = [0u8; 1500];
         match sip_socket.recv_from(&mut buf) {
             Ok((len, addr)) => {
                 if let Ok(text) = core::str::from_utf8(&buf[..len]) {
-                    if let Ok(msg) = sip_core::parse_message(text) {
-                        if let Some((ip, port)) = handle_incoming_sip(msg, &audio_tx) {
-                            remote_rtp = Some((ip, port));
-                            dialog_state = DialogState::Established;
+                    match sip_core::parse_message(text) {
+                        Ok(sip_core::Message::Response(resp)) => {
+                            match sip.on_register_response(&resp) {
+                                RegistrationResult::Registered(expires) => {
+                                    let next = (expires as u64 * 8) / 10;
+                                    next_register =
+                                        Instant::now() + Duration::from_secs(next.max(5));
+                                }
+                                RegistrationResult::AuthRequired => {
+                                    pending_auth = sip.registration.last_challenge();
+                                    next_register = Instant::now() + Duration::from_secs(1);
+                                }
+                                RegistrationResult::Failed(code) => {
+                                    warn!("registration failed with {}", code);
+                                    next_register = Instant::now() + Duration::from_secs(30);
+                                }
+                                RegistrationResult::Sent => {}
+                            }
+                            if last_reg_state != sip.registration.state() {
+                                last_reg_state = sip.registration.state();
+                                debug!("registration state -> {:?}", last_reg_state);
+                            }
+                            if let Some((ip, port)) =
+                                handle_incoming_sip(sip_core::Message::Response(resp), &audio_tx)
+                            {
+                                remote_rtp = Some((ip, port));
+                                dialog_state = DialogState::Established;
+                            }
                         }
-                    } else {
-                        warn!("failed to parse SIP from {addr}");
+                        Ok(msg) => {
+                            if let Some((ip, port)) = handle_incoming_sip(msg, &audio_tx) {
+                                remote_rtp = Some((ip, port));
+                                dialog_state = DialogState::Established;
+                            }
+                        }
+                        Err(_) => warn!("failed to parse SIP from {addr}"),
                     }
                 }
             }
@@ -194,4 +264,20 @@ fn parse_uri(uri: &str) -> String {
         host.push_str(":5060");
     }
     host
+}
+
+fn build_contact_uri(template: &str, ip: &str, port: u16) -> String {
+    let user_part = template
+        .trim_start_matches("sip:")
+        .split('@')
+        .next()
+        .unwrap_or(template);
+    format!("sip:{}@{}:{}", user_part, ip, port)
+}
+
+fn local_ip_port(sock: &UdpSocket) -> (String, u16) {
+    let addr = sock
+        .local_addr()
+        .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+    (addr.ip().to_string(), addr.port())
 }

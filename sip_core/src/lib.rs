@@ -1,13 +1,20 @@
 use core::fmt::Write;
+use core::time::Duration;
 use heapless::{String, Vec};
 use thiserror::Error;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+use md5::{Digest, Md5};
 
 const MAX_URI_LEN: usize = 96;
 const MAX_HEADER_NAME: usize = 32;
-const MAX_HEADER_VALUE: usize = 160;
+const MAX_HEADER_VALUE: usize = 256;
 const MAX_REASON_LEN: usize = 64;
 const MAX_BODY_LEN: usize = 256;
 const MAX_HEADERS: usize = 16;
+const MAX_TAG_LEN: usize = 32;
+const MAX_BRANCH_LEN: usize = 64;
+const MAX_CALL_ID_LEN: usize = 64;
 
 pub type SmallString<const N: usize> = String<N>;
 
@@ -33,6 +40,20 @@ impl Version {
 pub struct Header {
     pub name: SmallString<MAX_HEADER_NAME>,
     pub value: SmallString<MAX_HEADER_VALUE>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SipTransactionId {
+    pub branch: SmallString<MAX_BRANCH_LEN>,
+    pub call_id: SmallString<MAX_CALL_ID_LEN>,
+    pub cseq: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SipDialogId {
+    pub call_id: SmallString<MAX_CALL_ID_LEN>,
+    pub local_tag: SmallString<MAX_TAG_LEN>,
+    pub remote_tag: Option<SmallString<MAX_TAG_LEN>>,
 }
 
 pub type HeaderList = Vec<Header, MAX_HEADERS>;
@@ -67,6 +88,7 @@ pub enum RegistrationState {
     Unregistered,
     Registering,
     Registered,
+    Error,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -286,45 +308,156 @@ fn parse_method(input: &str) -> Result<Method> {
     }
 }
 
-#[derive(Debug, Default)]
+pub fn header_value<'a>(headers: &'a HeaderList, name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case(name))
+        .map(|h| h.value.as_str())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DigestChallenge {
+    pub realm: SmallString<MAX_HEADER_VALUE>,
+    pub nonce: SmallString<MAX_HEADER_VALUE>,
+    pub algorithm: SmallString<MAX_HEADER_VALUE>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DigestCredentials<'a> {
+    pub username: &'a str,
+    pub password: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationResult {
+    Sent,
+    Registered(u32),
+    AuthRequired,
+    Failed(u16),
+}
+
+#[derive(Debug)]
 pub struct RegistrationTransaction {
     state: RegistrationState,
     cseq: u32,
+    call_id: SmallString<MAX_CALL_ID_LEN>,
+    from_tag: SmallString<MAX_TAG_LEN>,
+    to_tag: SmallString<MAX_TAG_LEN>,
+    branch_counter: u32,
+    last_expires: u32,
+    last_challenge: Option<DigestChallenge>,
+}
+
+impl Default for RegistrationTransaction {
+    fn default() -> Self {
+        Self {
+            state: RegistrationState::Unregistered,
+            cseq: 0,
+            call_id: unique_token::<MAX_CALL_ID_LEN>("reg"),
+            from_tag: unique_token::<MAX_TAG_LEN>("from"),
+            to_tag: unique_token::<MAX_TAG_LEN>("to"),
+            branch_counter: 1,
+            last_expires: 3600,
+            last_challenge: None,
+        }
+    }
 }
 
 impl RegistrationTransaction {
-    pub fn start(&mut self, uri: &str, contact: &str) -> Result<Request> {
+    pub fn build_register(
+        &mut self,
+        registrar_uri: &str,
+        contact_uri: &str,
+        via_host: &str,
+        via_port: u16,
+        expires: u32,
+        auth_header: Option<Header>,
+    ) -> Result<Request> {
         if self.state == RegistrationState::Registering {
             return Err(SipError::InvalidState("already registering"));
         }
-        self.state = RegistrationState::Registering;
-        self.cseq += 1;
 
-        let mut req = Request::new(Method::Register, uri)?;
-        req.add_header(Header::new("To", uri)?)?;
-        req.add_header(Header::new("From", contact)?)?;
-        req.add_header(Header::new("Call-ID", "1")?)?;
-        req.add_header(Header::new("CSeq", &format_cseq(self.cseq, "REGISTER")?)?)?;
+        self.cseq = self.cseq.wrapping_add(1);
+        self.state = RegistrationState::Registering;
+
+        let mut req = Request::new(Method::Register, registrar_uri)?;
+        let via = build_via(via_host, via_port, self.next_branch())?;
+        let from = build_from(contact_uri, &self.from_tag)?;
+        let to = build_to(contact_uri, &self.to_tag)?;
+
+        req.add_header(via)?;
+        req.add_header(Header::new("Max-Forwards", "70")?)?;
+        req.add_header(from)?;
+        req.add_header(to)?;
+        req.add_header(Header::new("Call-ID", &self.call_id)?)?;
+        req.add_header(Header::new(
+            "CSeq",
+            &format_cseq(self.cseq, "REGISTER")?,
+        )?)?;
+        req.add_header(Header::new("Contact", contact_uri)?)?;
+        req.add_header(Header::new("Expires", &expires.to_string())?)?;
+        if let Some(auth) = auth_header {
+            req.add_header(auth)?;
+        }
+        req.add_header(Header::new("Content-Length", "0")?)?;
+
         Ok(req)
     }
 
-    pub fn handle_response(&mut self, status: u16) {
-        if status == 200 {
-            self.state = RegistrationState::Registered;
-        } else {
-            self.state = RegistrationState::Unregistered;
+    pub fn handle_response(&mut self, resp: &Response) -> RegistrationResult {
+        match resp.status_code {
+            200 => {
+                self.state = RegistrationState::Registered;
+                let expires = header_value(&resp.headers, "Expires")
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(self.last_expires);
+                self.last_expires = expires;
+                RegistrationResult::Registered(expires)
+            }
+            401 | 407 => {
+                if let Some(chal) = resp
+                    .headers
+                    .iter()
+                    .find(|h| h.name.eq_ignore_ascii_case("WWW-Authenticate"))
+                    .and_then(|h| parse_www_authenticate(&h.value).ok())
+                {
+                    self.last_challenge = Some(chal);
+                }
+                self.state = RegistrationState::Unregistered;
+                RegistrationResult::AuthRequired
+            }
+            code => {
+                self.state = RegistrationState::Error;
+                RegistrationResult::Failed(code)
+            }
         }
     }
 
     pub fn state(&self) -> RegistrationState {
         self.state
     }
+
+    pub fn last_expires(&self) -> u32 {
+        self.last_expires
+    }
+
+    pub fn last_challenge(&self) -> Option<DigestChallenge> {
+        self.last_challenge.clone()
+    }
+
+    fn next_branch(&mut self) -> SmallString<MAX_BRANCH_LEN> {
+        let mut branch = SmallString::<MAX_BRANCH_LEN>::new();
+        let counter = self.branch_counter;
+        self.branch_counter = self.branch_counter.wrapping_add(1);
+        let _ = write!(branch, "z9hG4bK{:08x}", counter);
+        branch
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct Dialog {
     state: DialogState,
-    call_id: Option<SmallString<MAX_HEADER_VALUE>>,
+    call_id: Option<SmallString<MAX_CALL_ID_LEN>>,
     cseq: u32,
 }
 
@@ -389,12 +522,16 @@ impl Dialog {
 
     fn ensure_call_id(&mut self) -> Result<SmallString<MAX_HEADER_VALUE>> {
         if let Some(id) = &self.call_id {
-            return Ok(id.clone());
+            let mut out: SmallString<MAX_HEADER_VALUE> = SmallString::new();
+            out.push_str(id).map_err(|_| SipError::Capacity)?;
+            return Ok(out);
         }
-        let mut id: SmallString<MAX_HEADER_VALUE> = SmallString::new();
+        let mut id: SmallString<MAX_CALL_ID_LEN> = SmallString::new();
         id.push_str("call-1").map_err(|_| SipError::Capacity)?;
         self.call_id = Some(id.clone());
-        Ok(id)
+        let mut out: SmallString<MAX_HEADER_VALUE> = SmallString::new();
+        out.push_str(&id).map_err(|_| SipError::Capacity)?;
+        Ok(out)
     }
 }
 
@@ -405,12 +542,21 @@ pub struct SipStack {
 }
 
 impl SipStack {
-    pub fn register(&mut self, uri: &str, contact: &str) -> Result<Request> {
-        self.registration.start(uri, contact)
+    pub fn register(
+        &mut self,
+        registrar_uri: &str,
+        contact_uri: &str,
+        via_host: &str,
+        via_port: u16,
+        expires: u32,
+        auth_header: Option<Header>,
+    ) -> Result<Request> {
+        self.registration
+            .build_register(registrar_uri, contact_uri, via_host, via_port, expires, auth_header)
     }
 
-    pub fn on_register_response(&mut self, status: u16) {
-        self.registration.handle_response(status);
+    pub fn on_register_response(&mut self, resp: &Response) -> RegistrationResult {
+        self.registration.handle_response(resp)
     }
 
     pub fn invite(&mut self, target: &str) -> Result<Request> {
@@ -430,6 +576,137 @@ fn format_cseq(seq: u32, method: &str) -> Result<SmallString<MAX_HEADER_VALUE>> 
     let mut buf: SmallString<MAX_HEADER_VALUE> = SmallString::new();
     write!(buf, "{} {}", seq, method).map_err(|_| SipError::Capacity)?;
     Ok(buf)
+}
+
+static GLOBAL_COUNTER: AtomicU32 = AtomicU32::new(1);
+
+fn unique_token<const N: usize>(prefix: &str) -> SmallString<N> {
+    let mut token = SmallString::<N>::new();
+    let counter = GLOBAL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0));
+    let _ = write!(token, "{}-{:x}-{:x}", prefix, now.as_secs(), counter);
+    token
+}
+
+fn build_via(host: &str, port: u16, branch: SmallString<MAX_BRANCH_LEN>) -> Result<Header> {
+    let mut value: SmallString<MAX_HEADER_VALUE> = SmallString::new();
+    write!(value, "SIP/2.0/UDP {}:{};branch={};rport", host, port, branch)
+        .map_err(|_| SipError::Capacity)?;
+    Header::new("Via", &value)
+}
+
+fn build_from(uri: &str, tag: &str) -> Result<Header> {
+    let mut value: SmallString<MAX_HEADER_VALUE> = SmallString::new();
+    write!(value, "{};tag={}", uri, tag).map_err(|_| SipError::Capacity)?;
+    Header::new("From", &value)
+}
+
+fn build_to(uri: &str, tag: &str) -> Result<Header> {
+    let mut value: SmallString<MAX_HEADER_VALUE> = SmallString::new();
+    write!(value, "{};tag={}", uri, tag).map_err(|_| SipError::Capacity)?;
+    Header::new("To", &value)
+}
+
+pub fn parse_www_authenticate(input: &str) -> Result<DigestChallenge> {
+    let mut parts = input.trim().splitn(2, ' ');
+    let scheme = parts.next().ok_or(SipError::Invalid("auth scheme"))?;
+    if !scheme.eq_ignore_ascii_case("digest") {
+        return Err(SipError::Invalid("auth scheme"));
+    }
+    let params = parts
+        .next()
+        .ok_or(SipError::Invalid("auth params"))?;
+
+    let mut realm: Option<SmallString<MAX_HEADER_VALUE>> = None;
+    let mut nonce: Option<SmallString<MAX_HEADER_VALUE>> = None;
+    let mut algorithm: SmallString<MAX_HEADER_VALUE> = SmallString::new();
+    algorithm
+        .push_str("MD5")
+        .map_err(|_| SipError::Capacity)?;
+
+    for param in params.split(',') {
+        let mut kv = param.trim().splitn(2, '=');
+        let key = kv
+            .next()
+            .ok_or(SipError::Invalid("auth key"))?
+            .trim();
+        let raw_val = kv
+            .next()
+            .ok_or(SipError::Invalid("auth value"))?
+            .trim()
+            .trim_matches('"');
+        match key.to_ascii_lowercase().as_str() {
+            "realm" => {
+                let mut v: SmallString<MAX_HEADER_VALUE> = SmallString::new();
+                v.push_str(raw_val).map_err(|_| SipError::Capacity)?;
+                realm = Some(v);
+            }
+            "nonce" => {
+                let mut v: SmallString<MAX_HEADER_VALUE> = SmallString::new();
+                v.push_str(raw_val).map_err(|_| SipError::Capacity)?;
+                nonce = Some(v);
+            }
+            "algorithm" => {
+                algorithm.clear();
+                algorithm.push_str(raw_val).map_err(|_| SipError::Capacity)?;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(DigestChallenge {
+        realm: realm.ok_or(SipError::Invalid("realm"))?,
+        nonce: nonce.ok_or(SipError::Invalid("nonce"))?,
+        algorithm,
+    })
+}
+
+pub fn authorization_header(
+    challenge: &DigestChallenge,
+    creds: &DigestCredentials<'_>,
+    method: &str,
+    uri: &str,
+) -> Result<Header> {
+    let response = compute_digest_response(challenge, creds, method, uri)?;
+    let mut value: SmallString<MAX_HEADER_VALUE> = SmallString::new();
+    write!(
+        value,
+        "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\", algorithm={}",
+        creds.username, challenge.realm, challenge.nonce, uri, response, challenge.algorithm
+    )
+    .map_err(|_| SipError::Capacity)?;
+    Header::new("Authorization", &value)
+}
+
+fn compute_digest_response(
+    challenge: &DigestChallenge,
+    creds: &DigestCredentials<'_>,
+    method: &str,
+    uri: &str,
+) -> Result<SmallString<MAX_HEADER_VALUE>> {
+    let mut a1 = SmallString::<MAX_HEADER_VALUE>::new();
+    write!(a1, "{}:{}:{}", creds.username, challenge.realm, creds.password)
+        .map_err(|_| SipError::Capacity)?;
+    let mut a2 = SmallString::<MAX_HEADER_VALUE>::new();
+    write!(a2, "{}:{}", method, uri).map_err(|_| SipError::Capacity)?;
+
+    let ha1 = md5_hex(a1.as_bytes());
+    let ha2 = md5_hex(a2.as_bytes());
+
+    let mut combo = SmallString::<MAX_HEADER_VALUE>::new();
+    write!(combo, "{}:{}:{}", ha1, challenge.nonce, ha2).map_err(|_| SipError::Capacity)?;
+    Ok(md5_hex(combo.as_bytes()))
+}
+
+fn md5_hex(data: &[u8]) -> SmallString<MAX_HEADER_VALUE> {
+    let digest = Md5::digest(data);
+    let mut out = SmallString::<MAX_HEADER_VALUE>::new();
+    for b in &digest {
+        let _ = write!(out, "{:02x}", b);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -464,9 +741,21 @@ mod tests {
     #[test]
     fn registration_flow() {
         let mut reg = RegistrationTransaction::default();
-        let req = reg.start("sip:user@example.com", "sip:user@example.com").unwrap();
+        let req = reg
+            .build_register(
+                "sip:user@example.com",
+                "sip:user@example.com",
+                "192.0.2.1",
+                5060,
+                120,
+                None,
+            )
+            .unwrap();
         assert_eq!(req.method, Method::Register);
-        reg.handle_response(200);
+        let mut resp = Response::new(200, "OK").unwrap();
+        resp.add_header(Header::new("Expires", "120").unwrap())
+            .unwrap();
+        reg.handle_response(&resp);
         assert_eq!(reg.state(), RegistrationState::Registered);
     }
 
@@ -480,5 +769,53 @@ mod tests {
         assert_eq!(ack.method, Method::Ack);
         let bye = dialog.bye("sip:200@example.com").unwrap();
         assert_eq!(bye.method, Method::Bye);
+    }
+
+    #[test]
+    fn register_builder_adds_headers() {
+        let mut reg = RegistrationTransaction::default();
+        let req = reg
+            .build_register(
+                "sip:registrar@example.com",
+                "sip:user@192.0.2.1:5060",
+                "192.0.2.1",
+                5060,
+                300,
+                None,
+            )
+            .unwrap();
+        let rendered = req.render().unwrap();
+        assert!(rendered.contains("Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK"));
+        assert!(rendered.contains("From: sip:user@192.0.2.1:5060;tag="));
+        assert!(rendered.contains("To: sip:user@192.0.2.1:5060;tag="));
+        assert!(rendered.contains("Contact: sip:user@192.0.2.1:5060"));
+        assert!(rendered.contains("CSeq: 1 REGISTER"));
+        assert!(rendered.contains("Expires: 300"));
+    }
+
+    #[test]
+    fn digest_auth_header_matches_reference() {
+        let challenge = parse_www_authenticate(
+            r#"Digest realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", algorithm=MD5"#,
+        )
+        .unwrap();
+        let creds = DigestCredentials {
+            username: "Mufasa",
+            password: "Circle Of Life",
+        };
+        let header = authorization_header(&challenge, &creds, "GET", "/dir/index.html").unwrap();
+        assert!(
+            header
+                .value
+                .contains("response=\"670fd8c2df070c60b045671b8b24ff02\""),
+            "unexpected header: {}",
+            header.value
+        );
+    }
+
+    #[test]
+    fn md5_round_trip_reference() {
+        let digest = md5_hex(b"abc");
+        assert_eq!(digest.as_str(), "900150983cd24fb0d6963f7d28e17f72");
     }
 }
