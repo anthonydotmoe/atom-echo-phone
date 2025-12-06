@@ -1,32 +1,161 @@
+use core::fmt::Write;
+use heapless::{String, Vec};
 use thiserror::Error;
+
+const MAX_ORIGIN_LEN: usize = 48;
+const MAX_ADDR_LEN: usize = 48;
+const MAX_SDP_LEN: usize = 256;
+
+pub type SmallString<const N: usize> = String<N>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Codec {
+    Pcmu,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaDescription {
+    pub port: u16,
+    pub payload_type: u8,
+    pub codec: Codec,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionDescription {
-    pub origin: String,
-    pub connection_address: String,
-    pub media_port: u16,
-    pub payload_type: u8,
+    pub origin: SmallString<MAX_ORIGIN_LEN>,
+    pub connection_address: SmallString<MAX_ADDR_LEN>,
+    pub media: MediaDescription,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum SdpError {
     #[error("invalid SDP: {0}")]
-    Invalid(String),
+    Invalid(&'static str),
+    #[error("buffer too small")]
+    Capacity,
 }
 
 impl SessionDescription {
-    pub fn offer() -> Self {
-        Self {
-            origin: "atom-echo".into(),
-            connection_address: "0.0.0.0".into(),
-            media_port: 10_000,
-            payload_type: 0,
-        }
+    pub fn offer(origin: &str, address: &str, port: u16) -> Result<Self, SdpError> {
+        let mut origin_buf: SmallString<MAX_ORIGIN_LEN> = SmallString::new();
+        origin_buf.push_str(origin).map_err(|_| SdpError::Capacity)?;
+
+        let mut address_buf: SmallString<MAX_ADDR_LEN> = SmallString::new();
+        address_buf
+            .push_str(address)
+            .map_err(|_| SdpError::Capacity)?;
+
+        Ok(Self {
+            origin: origin_buf,
+            connection_address: address_buf,
+            media: MediaDescription {
+                port,
+                payload_type: 0,
+                codec: Codec::Pcmu,
+            },
+        })
+    }
+
+    pub fn answer(&self, address: &str, port: u16) -> Result<Self, SdpError> {
+        SessionDescription::offer(&self.origin, address, port)
+    }
+
+    pub fn render(&self) -> Result<SmallString<MAX_SDP_LEN>, SdpError> {
+        let mut out: SmallString<MAX_SDP_LEN> = SmallString::new();
+        writeln!(out, "v=0").map_err(|_| SdpError::Capacity)?;
+        writeln!(out, "o={} 0 0 IN IP4 {}", self.origin, self.connection_address)
+            .map_err(|_| SdpError::Capacity)?;
+        writeln!(out, "s=-").map_err(|_| SdpError::Capacity)?;
+        writeln!(out, "c=IN IP4 {}", self.connection_address).map_err(|_| SdpError::Capacity)?;
+        writeln!(out, "t=0 0").map_err(|_| SdpError::Capacity)?;
+        writeln!(
+            out,
+            "m=audio {} RTP/AVP {}",
+            self.media.port, self.media.payload_type
+        )
+        .map_err(|_| SdpError::Capacity)?;
+        writeln!(out, "a=rtpmap:{} PCMU/8000", self.media.payload_type)
+            .map_err(|_| SdpError::Capacity)?;
+        Ok(out)
     }
 }
 
-pub fn parse(_input: &str) -> Result<SessionDescription, SdpError> {
-    Ok(SessionDescription::offer())
+pub fn parse(input: &str) -> Result<SessionDescription, SdpError> {
+    let mut origin: Option<SmallString<MAX_ORIGIN_LEN>> = None;
+    let mut address: Option<SmallString<MAX_ADDR_LEN>> = None;
+    let mut media_port: Option<u16> = None;
+    let mut payload_type: Option<u8> = None;
+
+    for raw_line in input.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        let mut parts = line.splitn(2, '=');
+        let prefix = parts
+            .next()
+            .ok_or(SdpError::Invalid("missing prefix"))?;
+        let rest = parts
+            .next()
+            .ok_or(SdpError::Invalid("missing value"))?;
+
+        match prefix {
+            "o" => {
+                let fields: Vec<&str, 6> = rest.split_whitespace().collect();
+                if fields.len() < 6 {
+                    return Err(SdpError::Invalid("origin line"));
+                }
+                let mut buf: SmallString<MAX_ORIGIN_LEN> = SmallString::new();
+                buf.push_str(fields[0]).map_err(|_| SdpError::Capacity)?;
+                origin = Some(buf);
+            }
+            "c" => {
+                let fields: Vec<&str, 3> = rest.split_whitespace().collect();
+                if fields.len() != 3 {
+                    return Err(SdpError::Invalid("connection line"));
+                }
+                let mut buf: SmallString<MAX_ADDR_LEN> = SmallString::new();
+                buf.push_str(fields[2]).map_err(|_| SdpError::Capacity)?;
+                address = Some(buf);
+            }
+            "m" => {
+                let fields: Vec<&str, 4> = rest.split_whitespace().collect();
+                if fields.len() < 4 || fields[0] != "audio" {
+                    return Err(SdpError::Invalid("media line"));
+                }
+                media_port = fields[1].parse().ok();
+                payload_type = fields[3].parse().ok();
+            }
+            "a" => {
+                if rest.starts_with("rtpmap:") {
+                    let mut comps = rest["rtpmap:".len()..].split_whitespace();
+                    let pt = comps
+                        .next()
+                        .ok_or(SdpError::Invalid("rtpmap payload"))?;
+                    let codec = comps
+                        .next()
+                        .ok_or(SdpError::Invalid("rtpmap codec"))?;
+                    if !codec.eq_ignore_ascii_case("PCMU/8000") {
+                        return Err(SdpError::Invalid("codec"));
+                    }
+                    payload_type = pt.parse().ok();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let origin = origin.ok_or(SdpError::Invalid("missing origin"))?;
+    let connection_address = address.ok_or(SdpError::Invalid("missing address"))?;
+    let port = media_port.ok_or(SdpError::Invalid("missing media port"))?;
+    let payload_type = payload_type.ok_or(SdpError::Invalid("missing payload type"))?;
+
+    Ok(SessionDescription {
+        origin,
+        connection_address,
+        media: MediaDescription {
+            port,
+            payload_type,
+            codec: Codec::Pcmu,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -34,8 +163,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builds_basic_offer() {
-        let offer = SessionDescription::offer();
-        assert_eq!(offer.payload_type, 0);
+    fn builds_and_renders_offer() {
+        let offer = SessionDescription::offer("atom-echo", "192.0.2.10", 10000).unwrap();
+        let rendered = offer.render().unwrap();
+        assert!(rendered.contains("m=audio 10000 RTP/AVP 0"));
+        assert!(rendered.contains("a=rtpmap:0 PCMU/8000"));
+    }
+
+    #[test]
+    fn parses_minimal_sdp() {
+        let raw = "\
+v=0
+o=atom-echo 0 0 IN IP4 192.0.2.10
+s=-
+c=IN IP4 192.0.2.10
+t=0 0
+m=audio 20000 RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+";
+        let parsed = parse(raw).unwrap();
+        assert_eq!(parsed.media.port, 20000);
+        assert_eq!(parsed.media.payload_type, 0);
+        assert_eq!(parsed.media.codec, Codec::Pcmu);
     }
 }
