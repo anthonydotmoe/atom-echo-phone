@@ -4,7 +4,7 @@ use super::{ButtonState, HardwareError, LedState, WifiConfig};
 mod esp {
     use super::*;
     use esp_idf_hal::gpio::AnyIOPin;
-    use esp_idf_hal::gpio::{Gpio27, Gpio39, Input, PinDriver};
+    use esp_idf_hal::gpio::{Gpio39, Input, PinDriver};
     use esp_idf_hal::i2s::{config::StdConfig, I2sBiDir, I2sDriver};
     use esp_idf_hal::peripherals::Peripherals;
     use esp_idf_hal::rmt::{config::TransmitConfig, FixedLengthSignal, PinState, Pulse, TxRmtDriver};
@@ -64,9 +64,6 @@ mod esp {
         let din = pins.gpio23;
         let dout = pins.gpio22;
         let ws = pins.gpio33;
-        let mclk: Option<AnyIOPin> = None;
-        let button_pin: Gpio39 = pins.gpio39;
-        let led_pin: Gpio27 = pins.gpio27;
 
         // 16-bit PCM at 8 kHz, Philips standard.
         let std_config = StdConfig::philips(8_000, esp_idf_hal::i2s::config::DataBitWidth::Bits16);
@@ -77,7 +74,7 @@ mod esp {
             bclk,
             din,
             dout,
-            mclk,
+            Option::<AnyIOPin>::None,
             ws,
         )
         .map_err(map_audio_err)?;
@@ -85,9 +82,11 @@ mod esp {
         info!("I2S configured for bidirectional audio");
 
         // Button input (pull-up, active-low)
+        let button_pin = pins.gpio39;
         let button = PinDriver::input(button_pin).map_err(map_gpio_err)?;
 
         // LED via RMT-driven WS2812
+        let led_pin = pins.gpio27;
         let led = TxRmtDriver::new(
             peripherals.rmt.channel0,
             led_pin,
