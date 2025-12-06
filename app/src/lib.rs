@@ -1,9 +1,13 @@
-use atom_echo_hw::{init_audio, init_wifi, LedState, WifiConfig};
+use std::sync::mpsc::channel;
+use std::thread;
+use std::time::Duration;
+
+use atom_echo_hw::{Device, WifiConfig};
 use log::info;
-use rtp_audio::JitterBuffer;
-use sdp::SessionDescription;
-use sip_core::SipStack;
 use thiserror::Error;
+
+mod messages;
+mod tasks;
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -14,32 +18,19 @@ pub enum AppError {
 }
 
 pub fn run() -> Result<(), AppError> {
-    info!("starting application skeleton");
+    info!("starting Atom Echo phone runtime");
 
-    let wifi_config = WifiConfig {
-        ssid: "ssid".into(),
-        password: "password".into(),
-    };
-    init_wifi(wifi_config).map_err(|err| AppError::Hardware(err.to_string()))?;
-    let mut audio = init_audio().map_err(|err| AppError::Hardware(err.to_string()))?;
-    let mut sip = SipStack::default();
-    let _register = sip
-        .register("sip:user@example.com", "sip:user@example.com")
-        .map_err(|err| AppError::Sip(err.to_string()))?;
-    sip.on_register_response(200);
+    let wifi_config = WifiConfig::new("test-ssid", "test-pass")
+        .map_err(|err| AppError::Hardware(format!("{err:?}")))?;
+    let device = Device::init(wifi_config).map_err(|err| AppError::Hardware(format!("{err:?}")))?;
 
-    let _local_sdp = SessionDescription::offer("atom-echo", "0.0.0.0", 10_000)
-        .map_err(|err| AppError::Sip(format!("sdp render: {err}")))?;
-    let mut jitter: JitterBuffer<4, 160> = JitterBuffer::new();
-    jitter.push_frame(0, &[0; 160]);
-    let _ = jitter.pop_frame();
+    let (sip_tx, sip_rx) = channel::<messages::SipCommand>();
+    let (audio_tx, audio_rx) = channel::<messages::AudioCommand>();
 
-    let _ = atom_echo_hw::set_led_state(&mut audio, LedState::Color {
-        red: 0,
-        green: 255,
-        blue: 0,
-    });
+    let _hw_handle = tasks::hardware::spawn_hardware_task(device, sip_tx, audio_rx);
+    let _sip_handle = tasks::sip::spawn_sip_task(sip_rx, audio_tx);
 
-    info!("application skeleton initialized");
-    Ok(())
+    loop {
+        thread::sleep(Duration::from_secs(1));
+    }
 }

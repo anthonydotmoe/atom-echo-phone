@@ -15,6 +15,7 @@ atom_echo_hw = { path = "../atom_echo_hw" }
 rtp_audio = { path = "../rtp_audio" }
 sdp = { path = "../sdp" }
 sip_core = { path = "../sip_core" }
+heapless.workspace = true
 
 [target.'cfg(target_os = "espidf")'.dependencies]
 esp-idf-svc = "0.51"
