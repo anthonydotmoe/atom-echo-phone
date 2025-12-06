@@ -4,7 +4,10 @@ use super::{ButtonState, HardwareError, LedState, WifiConfig};
 mod esp {
     use super::*;
     use esp_idf_hal::gpio::AnyIOPin;
+    use esp_idf_hal::gpio::{Gpio27, Gpio39, Input, PinDriver};
     use esp_idf_hal::i2s::{config::StdConfig, I2sBiDir, I2sDriver};
+    use esp_idf_hal::peripherals::Peripherals;
+    use esp_idf_hal::rmt::{config::TransmitConfig, FixedLengthSignal, PinState, Pulse, TxRmtDriver};
     use esp_idf_svc::eventloop::EspSystemEventLoop;
     use esp_idf_svc::wifi::{ClientConfiguration, Configuration, EspWifi};
     use esp_idf_sys::EspError;
@@ -18,13 +21,13 @@ mod esp {
     pub struct DeviceInner {
         wifi: EspWifi<'static>,
         i2s: I2sDriver<'static, I2sBiDir>,
-        // TODO: add button GPIO and LED driver fields here.
+        button: PinDriver<'static, Gpio39, Input>,
+        led: TxRmtDriver<'static>,
     }
 
     pub fn init_device(config: WifiConfig) -> Result<DeviceInner, HardwareError> {
         // Take all shared peripherals once and wire them into the handle.
-        let peripherals = esp_idf_hal::peripherals::Peripherals::take()
-            .map_err(map_wifi_err)?;
+        let peripherals = Peripherals::take().map_err(map_wifi_err)?;
         let sysloop = EspSystemEventLoop::take().map_err(map_wifi_err)?;
 
         // --- Wi-Fi ---
@@ -62,6 +65,8 @@ mod esp {
         let dout = pins.gpio22;
         let ws = pins.gpio33;
         let mclk: Option<AnyIOPin> = None;
+        let button_pin: Gpio39 = pins.gpio39;
+        let led_pin: Gpio27 = pins.gpio27;
 
         // 16-bit PCM at 8 kHz, Philips standard.
         let std_config = StdConfig::philips(8_000, esp_idf_hal::i2s::config::DataBitWidth::Bits16);
@@ -79,10 +84,22 @@ mod esp {
 
         info!("I2S configured for bidirectional audio");
 
+        // Button input (pull-up, active-low)
+        let button = PinDriver::input(button_pin).map_err(map_gpio_err)?;
+
+        // LED via RMT-driven WS2812
+        let led = TxRmtDriver::new(
+            peripherals.rmt.channel0,
+            led_pin,
+            &TransmitConfig::new().clock_divider(2),
+        )
+        .map_err(map_gpio_err)?;
+
         Ok(DeviceInner {
             wifi,
             i2s,
-            // button, led fields to be added when implemented
+            button,
+            led,
         })
     }
 
@@ -104,22 +121,44 @@ mod esp {
         }
 
         pub fn read_button_state(&self) -> ButtonState {
-            // TODO: configure and read the actual GPIO (e.g., GPIO 39)
-            ButtonState::Released
+            // Active-low button: low means pressed.
+            if self.button.is_low() {
+                ButtonState::Pressed
+            } else {
+                ButtonState::Released
+            }
         }
 
         pub fn set_led_state(&mut self, state: LedState) -> Result<(), HardwareError> {
-            // TODO: drive the Atom Echo neopixel via RMT or bit-banged GPIO.
-            match state {
-                LedState::Off => {
-                    // turn off LED
-                }
-                LedState::Color { red, green, blue } => {
-                    let _ = (red, green, blue);
-                    // set LED color
+            let (g, r, b) = match state {
+                LedState::Off => (0, 0, 0),
+                LedState::Color { red, green, blue } => (green, red, blue), // GRB order
+            };
+
+            // WS2812 timing: T0H=0.35us, T0L=0.8us, T1H=0.7us, T1L=0.6us
+            let ticks_hz = self.led.counter_clock().map_err(map_gpio_err)?;
+            let t0h = Pulse::new_with_duration(ticks_hz, PinState::High, &core::time::Duration::from_nanos(350))
+                .map_err(map_gpio_err)?;
+            let t0l = Pulse::new_with_duration(ticks_hz, PinState::Low, &core::time::Duration::from_nanos(800))
+                .map_err(map_gpio_err)?;
+            let t1h = Pulse::new_with_duration(ticks_hz, PinState::High, &core::time::Duration::from_nanos(700))
+                .map_err(map_gpio_err)?;
+            let t1l = Pulse::new_with_duration(ticks_hz, PinState::Low, &core::time::Duration::from_nanos(600))
+                .map_err(map_gpio_err)?;
+
+            let mut signal = FixedLengthSignal::<24>::new();
+            let bits = [g, r, b];
+            let mut idx = 0;
+            for &component in &bits {
+                for bit in (0..8).rev() {
+                    let is_one = (component >> bit) & 1 == 1;
+                    let (h, l) = if is_one { (t1h, t1l) } else { (t0h, t0l) };
+                    signal.set(idx, &(h, l)).map_err(map_gpio_err)?;
+                    idx += 1;
                 }
             }
-            Ok(())
+
+            self.led.start_blocking(&signal).map_err(map_gpio_err)
         }
     }
 
@@ -132,6 +171,11 @@ mod esp {
     fn map_audio_err(err: EspError) -> HardwareError {
         log::error!("Audio error: {:?}", err);
         HardwareError::Audio("audio error")
+    }
+
+    fn map_gpio_err(err: EspError) -> HardwareError {
+        log::error!("GPIO error: {:?}", err);
+        HardwareError::Gpio("gpio error")
     }
 }
 
@@ -184,4 +228,3 @@ pub use host::DeviceInner;
 pub use esp::init_device;
 #[cfg(not(target_os = "espidf"))]
 pub use host::init_device;
-
