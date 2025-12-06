@@ -11,13 +11,18 @@ use sip_core::{DialogState, SipStack};
 use crate::messages::{AudioCommand, AudioCommandSender, SipCommand, SipCommandReceiver};
 
 pub fn spawn_sip_task(
+    settings: &'static crate::settings::Settings,
     sip_rx: SipCommandReceiver,
     audio_tx: AudioCommandSender,
 ) -> thread::JoinHandle<()> {
-    thread::spawn(move || sip_loop(sip_rx, audio_tx))
+    thread::spawn(move || sip_loop(settings, sip_rx, audio_tx))
 }
 
-fn sip_loop(sip_rx: SipCommandReceiver, audio_tx: AudioCommandSender) {
+fn sip_loop(
+    settings: &'static crate::settings::Settings,
+    sip_rx: SipCommandReceiver,
+    audio_tx: AudioCommandSender,
+) {
     let mut sip = SipStack::default();
     let mut dialog_state = DialogState::Idle;
     let mut remote_rtp: Option<(HString<48>, u16)> = None;
@@ -25,7 +30,7 @@ fn sip_loop(sip_rx: SipCommandReceiver, audio_tx: AudioCommandSender) {
     let mut timestamp: u32 = 0;
 
     // Stub registration
-    if let Ok(req) = sip.register("sip:user@example.com", "sip:user@example.com") {
+    if let Ok(req) = sip.register(settings.sip_contact, settings.sip_contact) {
         info!("sending REGISTER: {:?}", req.render());
         sip.on_register_response(200);
     }

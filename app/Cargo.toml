@@ -16,6 +16,7 @@ rtp_audio = { path = "../rtp_audio" }
 sdp = { path = "../sdp" }
 sip_core = { path = "../sip_core" }
 heapless.workspace = true
+toml-cfg = "0.1"
 
 [target.'cfg(target_os = "espidf")'.dependencies]
 esp-idf-svc = "0.51"
