@@ -11,23 +11,29 @@ use sip_core::{
     SipStack,
 };
 
-use crate::messages::{AudioCommand, AudioCommandSender, ButtonEvent, SipCommand, SipCommandReceiver};
+use crate::messages::{AudioCommand, AudioCommandSender, ButtonEvent, RtpRxCommand, RtpRxCommandSender, RtpTxCommand, RtpTxCommandSender, SipCommand, SipCommandReceiver};
 
 pub fn spawn_sip_task(
     settings: &'static crate::settings::Settings,
     sip_rx: SipCommandReceiver,
     audio_tx: AudioCommandSender,
+    rtp_tx_tx: RtpTxCommandSender,
+    rtp_rx_tx: RtpRxCommandSender,
 ) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut task = SipTask::new(settings, sip_rx, audio_tx);
-        task.run();
-    })
+    thread::Builder::new()
+        .stack_size(64 * 1024)
+        .spawn(move || {
+            let mut task = SipTask::new(settings, sip_rx, audio_tx, rtp_tx_tx, rtp_rx_tx);
+            task.run();
+    }).unwrap()
 }
 
 struct SipTask {
     settings: &'static crate::settings::Settings,
     sip_rx: SipCommandReceiver,
     audio_tx: AudioCommandSender,
+    rtp_tx_tx: RtpTxCommandSender,
+    rtp_rx_tx: RtpRxCommandSender,
 
     sip: SipStack,
     dialog_state: DialogState,
@@ -55,17 +61,24 @@ impl SipTask {
         settings: &'static crate::settings::Settings,
         sip_rx: SipCommandReceiver,
         audio_tx: AudioCommandSender,
+        rtp_tx_tx: RtpTxCommandSender,
+        rtp_rx_tx: RtpRxCommandSender,
     ) -> Self {
-        let mut sip = SipStack::default();
-        let mut dialog_state = DialogState::Idle;
+        let sip = SipStack::default();
+        let dialog_state = DialogState::Idle;
 
         let registrar = parse_uri(settings.sip_registrar);
         let target = parse_uri(settings.sip_target);
 
         let sip_socket = UdpSocket::bind("0.0.0.0:0").expect("create SIP socket");
-        sip_socket
-            .set_nonblocking(true)
-            .expect("set nonblocking for SIP socket");
+        match sip_socket.set_nonblocking(true) {
+            Ok(_) => log::info!("Set SIP socket to non-blocking"),
+            Err(e) => {
+                log::error!("Set SIP socket to non-blocking: {:?}", e);
+
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
 
         if let Ok(addr) = registrar.parse::<std::net::SocketAddr>() {
             let _ = sip_socket.connect(addr);
@@ -87,6 +100,8 @@ impl SipTask {
             settings,
             sip_rx,
             audio_tx,
+            rtp_tx_tx,
+            rtp_rx_tx,
 
             sip,
             dialog_state,
@@ -216,22 +231,32 @@ impl SipTask {
     fn handle_sip_message(&mut self, msg: sip_core::Message) {
         match msg {
             sip_core::Message::Response(resp) => {
-                self.handle_register_response(&resp);
+                if resp.status_code == 200 && !resp.body.is_empty() {
+                    if let Ok(sdp) = sdp::parse(&resp.body) {
 
-                // Also let general incoming SIP handler look at responses
-                if let Some((ip, port)) =
-                    handle_incoming_sip(sip_core::Message::Response(resp), &self.audio_tx)
-                {
-                    self.remote_rtp = Some((ip, port));
-                    self.set_dialog_state(DialogState::Established);
+                        // If it's an SDP packet, let the RTP threads know
+
+                        let mut ip = HString::<48>::new();
+                        let _ = ip.push_str(&sdp.connection_address);
+                        let port = sdp.media.port;
+
+                        let _ = self.rtp_tx_tx.send(RtpTxCommand::StartStream {
+                            remote_ip: ip,
+                            remote_port: port,
+                            ssrc: 0,            //TODO: FixMe
+                            payload_type: 0,    //TODO: FixMe
+                        });
+
+                        let _ = self.rtp_rx_tx.send(RtpRxCommand::StartStream {
+                            expected_ssrc: 0, // TODO: FixMe
+                            payload_type: 0,  // TODO: FixMe
+                        });
+
+                        //return Some((ip, port));
+                    }
                 }
             }
-            other => {
-                if let Some((ip, port)) = handle_incoming_sip(other, &self.audio_tx) {
-                    self.remote_rtp = Some((ip, port));
-                    self.set_dialog_state(DialogState::Established);
-                }
-            }
+            _ => {}
         }
     }
 
@@ -300,34 +325,6 @@ impl SipTask {
             return;
         }
     }
-}
-
-
-fn handle_incoming_sip(
-    message: sip_core::Message,
-    audio_tx: &AudioCommandSender,
-) -> Option<(HString<48>, u16)> {
-    match message {
-        sip_core::Message::Response(resp) => {
-            if resp.status_code == 200 && !resp.body.is_empty() {
-                if let Ok(sdp) = sdp::parse(&resp.body) {
-                    let mut ip = HString::<48>::new();
-                    let _ = ip.push_str(&sdp.connection_address);
-                    let port = sdp.media.port;
-                    let _ = audio_tx.send(AudioCommand::SetRemoteRtpEndpoint {
-                        ip: ip.clone(),
-                        port,
-                    });
-                    let _ = audio_tx.send(AudioCommand::DialogStateChanged(
-                        DialogState::Established,
-                    ));
-                    return Some((ip, port));
-                }
-            }
-        }
-        _ => {}
-    }
-    None
 }
 
 fn send_sip(socket: &UdpSocket, target: &str, payload: &str) {

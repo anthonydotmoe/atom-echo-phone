@@ -2,6 +2,8 @@ use super::{ButtonState, HardwareError, LedState, WifiConfig};
 
 #[cfg(target_os = "espidf")]
 mod esp {
+    use std::time::{Duration, Instant};
+
     use super::*;
     use esp_idf_hal::gpio::AnyIOPin;
     use esp_idf_hal::gpio::{Gpio39, Input, PinDriver};
@@ -9,7 +11,8 @@ mod esp {
     use esp_idf_hal::peripherals::Peripherals;
     use esp_idf_hal::rmt::{config::TransmitConfig, FixedLengthSignal, PinState, Pulse, TxRmtDriver};
     use esp_idf_svc::eventloop::EspSystemEventLoop;
-    use esp_idf_svc::wifi::{ClientConfiguration, Configuration, EspWifi};
+    use esp_idf_svc::wifi::{AuthMethod, ClientConfiguration, Configuration, EspWifi};
+    use esp_idf_svc::nvs::EspDefaultNvsPartition;
     use esp_idf_sys::EspError;
     use heapless::String;
     use log::info;
@@ -20,19 +23,28 @@ mod esp {
     /// are implemented.
     pub struct DeviceInner {
         wifi: EspWifi<'static>,
+        /*
         i2s: I2sDriver<'static, I2sBiDir>,
         button: PinDriver<'static, Gpio39, Input>,
         led: TxRmtDriver<'static>,
+        */
     }
 
     pub fn init_device(config: WifiConfig) -> Result<DeviceInner, HardwareError> {
         // Take all shared peripherals once and wire them into the handle.
         let peripherals = Peripherals::take().map_err(map_wifi_err)?;
         let sysloop = EspSystemEventLoop::take().map_err(map_wifi_err)?;
+        let nvs = EspDefaultNvsPartition::take().map_err(map_wifi_err)?;
 
         // --- Wi-Fi ---
-        let mut wifi = EspWifi::new(peripherals.modem, sysloop, None)
+        let mut wifi = EspWifi::new(
+            peripherals.modem,
+            sysloop,
+            Some(nvs)
+        )
             .map_err(map_wifi_err)?;
+
+        info!("Connecting to \"{}\", pass: {}", &config.ssid, &config.password);
 
         // Convert heapless::String to the types EspWifi expects.
         let mut ssid = String::<32>::new();
@@ -44,19 +56,32 @@ mod esp {
             .push_str(&config.password)
             .map_err(|_| HardwareError::Config("password too long"))?;
 
-        let client_conf = ClientConfiguration {
+        let enterprise_conf = ClientConfiguration {
+            auth_method: AuthMethod::WPA2Enterprise,
             ssid,
-            password,
             ..Default::default()
         };
 
-        wifi.set_configuration(&Configuration::Client(client_conf))
+        wifi.set_configuration(&Configuration::Client(enterprise_conf))
             .map_err(map_wifi_err)?;
+
+        wifi.
         wifi.start().map_err(map_wifi_err)?;
         wifi.connect().map_err(map_wifi_err)?;
 
+        loop {
+            let ret = wifi.is_connected().unwrap();
+            if (ret) {
+                break;
+            }
+
+            info!("WiFi connecting...");
+            std::thread::sleep(Duration::from_secs(1))
+        }
+
         info!("Wi-Fi connected");
 
+        /*
         // --- I2S audio ---
         let pins = peripherals.pins;
 
@@ -93,12 +118,13 @@ mod esp {
             &TransmitConfig::new().clock_divider(2),
         )
         .map_err(map_gpio_err)?;
+        */
 
         Ok(DeviceInner {
             wifi,
-            i2s,
-            button,
-            led,
+            //i2s,
+            //button,
+            //led,
         })
     }
 
@@ -112,13 +138,16 @@ mod esp {
             Ok(buf.len())
         }
 
+        /*
         pub fn write_speaker_frame(&mut self, buf: &[i16]) -> Result<usize, HardwareError> {
             // TODO: implement real I2S write
             let _ = &self.i2s; // keep field "used" for now
             let _ = buf;
             Ok(buf.len())
         }
+        */
 
+        /*
         pub fn read_button_state(&self) -> ButtonState {
             // Active-low button: low means pressed.
             if self.button.is_low() {
@@ -127,7 +156,9 @@ mod esp {
                 ButtonState::Released
             }
         }
+        */
 
+        /*
         pub fn set_led_state(&mut self, state: LedState) -> Result<(), HardwareError> {
             let (g, r, b) = match state {
                 LedState::Off => (0, 0, 0),
@@ -159,6 +190,7 @@ mod esp {
 
             self.led.start_blocking(&signal).map_err(map_gpio_err)
         }
+    */
     }
 
     fn map_wifi_err(err: EspError) -> HardwareError {

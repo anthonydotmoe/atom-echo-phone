@@ -45,11 +45,15 @@ pub fn run() -> Result<(), AppError> {
     Audio -> RTP TX (mic): MediaOut
     RTP RX -> Audio (speaker): MediaIn
     */
-    let _ui_handle = tasks::ui::spawn_ui_task(device, ui_rx, sip_tx);
+
+    //let _ui_handle = tasks::ui::spawn_ui_task(device, ui_rx, sip_tx);
     let _sip_handle = tasks::sip::spawn_sip_task(&settings::SETTINGS, sip_rx, audio_tx, rtp_tx_tx, rtp_rx_tx);
+
+    /*
     let _rtp_tx_handle = tasks::rtp_tx::spawn_rtp_tx_task(rtp_tx_rx);
     let _rtp_rx_handle = tasks::rtp_rx::spawn_rtp_rx_task(rtp_rx_rx);
     let _audio_handle = tasks::audio::spawn_audio_task(device, audio_rx, media_in_rx, media_out_tx);
+    */
 
     loop {
         thread::sleep(Duration::from_secs(1));
