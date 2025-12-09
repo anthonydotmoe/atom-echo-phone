@@ -142,6 +142,17 @@ impl SipTask {
     // --- Registration --------------------------------------------------------
 
     fn maybe_send_register(&mut self, now: Instant) {
+        const REGISTER_TIMEOUT: Duration = Duration::from_secs(5);
+        let reg_state = self.core.registration.state();
+
+        // If we've been stuck in Registering for too long, treat it as a timeout
+        // and allow a retry.
+        if reg_state == RegistrationState::Registering && now >= self.next_register {
+            log::warn!("registration attempt timed out; retrying");
+            self.core.registration.reset_to_unregistered();
+            self.handle_reg_event(CoreRegistrationEvent::StateChanged(RegistrationState::Unregistered));
+        }
+
         let reg_state = self.core.registration.state();
 
         // Only send REGISTER when the timer fires and we're not already in-flight
@@ -201,7 +212,7 @@ impl SipTask {
         send_sip(&self.sip_socket, &self.registrar, &rendered);
 
         // Give a short window for the first response
-        //self.next_register = now + Duration::from_secs(5);
+        self.next_register = now + REGISTER_TIMEOUT;
     }
 
     fn build_auth_header(

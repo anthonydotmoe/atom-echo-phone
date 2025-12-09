@@ -126,6 +126,11 @@ impl RegistrationTransaction {
         self.last_expires
     }
 
+    /// Force the transaction back to Unregistered so callers can retry after a timeout.
+    pub fn reset_to_unregistered(&mut self) {
+        self.state = RegistrationState::Unregistered;
+    }
+
     pub fn last_challenge(&self) -> Option<DigestChallenge> {
         self.last_challenge.clone()
     }
@@ -204,5 +209,24 @@ mod tests {
         resp.add_header(Header::new("Expires", "120").unwrap());
         reg.handle_response(&resp);
         assert_eq!(reg.state(), RegistrationState::Registered);
+    }
+
+    #[test]
+    fn reset_allows_retry_after_timeout() {
+        let mut reg = RegistrationTransaction::default();
+        let _ = reg
+            .build_register(
+                "sip:user@example.com",
+                "sip:user@example.com",
+                "192.0.2.1",
+                5060,
+                120,
+                None,
+            )
+            .unwrap();
+        assert_eq!(reg.state(), RegistrationState::Registering);
+
+        reg.reset_to_unregistered();
+        assert_eq!(reg.state(), RegistrationState::Unregistered);
     }
 }
