@@ -8,6 +8,7 @@ pub enum Method {
     Invite,
     Ack,
     Bye,
+    Cancel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +156,7 @@ impl core::fmt::Display for Method {
             Method::Invite => write!(f, "INVITE"),
             Method::Ack => write!(f, "ACK"),
             Method::Bye => write!(f, "BYE"),
+            Method::Cancel => write!(f, "CANCEL"),
         }
     }
 }
@@ -256,6 +258,7 @@ fn parse_method(input: &str) -> Result<Method> {
         "INVITE" => Ok(Method::Invite),
         "ACK" => Ok(Method::Ack),
         "BYE" => Ok(Method::Bye),
+        "CANCEL" => Ok(Method::Cancel),
         _ => Err(SipError::Invalid("unknown method")),
     }
 }

@@ -6,3 +6,4 @@ sip_contact = "sip:user@example.com"
 sip_username = "user"
 sip_password = "pass"
 sip_target = "sip:100@example.com"
+ring_timeout = 15

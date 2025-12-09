@@ -21,6 +21,7 @@ pub enum CoreDialogEvent {
 pub enum CoreEvent {
     Registration(CoreRegistrationEvent),
     Dialog(CoreDialogEvent),
+    SendResponse(Response),
 }
 
 /// High-level SIP stack that wires registration + dialog together,
@@ -94,38 +95,21 @@ impl SipStack {
 
                     return events;
                 } else {
-                    // Outgoing dialog responses could be handled here too.
-                    self.handle_non_register_response(&resp, &mut events);
+                    // Non-REGISTER responses (e.g. INVITE/ACK/BYE flows) are
+                    // not handled yet.
+                    log::warn!("on_message: unhandled non-REGISTER response: {}", resp.status_code);
                 }
             }
             Message::Request(req) => {
-                if req.method == Method::Invite {
-                    self.handle_incoming_invite(req, &mut events);
-                } else {
-                    // You could extend this with BYE/CANCEL/etc handling.
+                match req.method {
+                    Method::Invite => self.handle_incoming_invite(req, &mut events),
+                    Method::Cancel => self.handle_incoming_cancel(req, &mut events),
+                    m => { log::warn!("on_message: unhandled request: {}", m); },
                 }
             }
         }
 
         events
-    }
-
-    fn handle_non_register_response(
-        &mut self,
-        resp: &Response,
-        events: &mut Vec<CoreEvent>,
-    ) {
-        // Very small outgoing-call support:
-        if let Some(cseq) = header_value(&resp.headers, "CSeq") {
-            if cseq.trim().ends_with("INVITE") {
-                let _ack = self.dialog.handle_final_response(resp.status_code);
-                // For now we don't emit an ACK request; the app can call
-                // dialog.build_ack() or handle_final_response directly if desired.
-                let _ = events.push(CoreEvent::Dialog(
-                    CoreDialogEvent::DialogStateChanged(self.dialog.state),
-                ));
-            }
-        }
     }
 
     fn handle_incoming_invite(
@@ -140,8 +124,36 @@ impl SipStack {
                 request: req,
             }));
             let _ = events.push(CoreEvent::Dialog(
-                CoreDialogEvent::DialogStateChanged(self.dialog.state),
+                CoreDialogEvent::DialogStateChanged(self.dialog.state.clone()),
             ));
+        }
+    }
+
+    fn handle_incoming_cancel(
+        &mut self,
+        req: Request,
+        events: &mut Vec<CoreEvent>,
+    ) {
+        match self.dialog.handle_incoming_cancel(&req) {
+            Ok(cancel_res) => {
+                // Emit the responses we must send
+                let _ = events.push(
+                    CoreEvent::SendResponse(cancel_res.cancel_ok),
+                );
+                if let Some(resp_487) = cancel_res.maybe_invite_487 {
+                    let _ = events.push(
+                        CoreEvent::SendResponse(resp_487),
+                    );
+                }
+
+                // And let the app know the dialog died
+                let _ = events.push(CoreEvent::Dialog(
+                    CoreDialogEvent::DialogStateChanged(self.dialog.state.clone()),
+                ));
+            }
+            Err(_e) => {
+                // log::warn!("handle_incoming_cancel: {:?}", e);
+            }
         }
     }
 

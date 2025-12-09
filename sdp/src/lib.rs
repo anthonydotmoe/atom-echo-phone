@@ -85,9 +85,10 @@ pub fn parse(input: &str) -> Result<SessionDescription, SdpError> {
     let mut origin: Option<String> = None;
     let mut address: Option<String> = None;
     let mut media_port: Option<u16> = None;
-    let mut payload_type: Option<u8> = None;
 
-    log::info!("parse:\r\n{}", input);
+    // Payload type we will use for PCMU, if any
+    let mut pcmu_pt = None;
+    let mut saw_pcmu = false;
 
     for raw_line in input.lines() {
         let line = raw_line.trim_end_matches('\r');
@@ -124,7 +125,6 @@ pub fn parse(input: &str) -> Result<SessionDescription, SdpError> {
                     return Err(SdpError::Invalid("media line"));
                 }
                 media_port = fields[1].parse().ok();
-                payload_type = fields[3].parse().ok();
             }
             "a" => {
                 if rest.starts_with("rtpmap:") {
@@ -140,7 +140,8 @@ pub fn parse(input: &str) -> Result<SessionDescription, SdpError> {
 
                     // We only support PCMU/8000; ignore other codecs.
                     if codec.to_ascii_uppercase().starts_with("PCMU/8000") {
-                        payload_type = pt.parse().ok();
+                        pcmu_pt = pt.parse().ok();
+                        saw_pcmu = true;
                     } else {
                         // Ignore telephone-event, G722, etc.
                     }
@@ -153,17 +154,26 @@ pub fn parse(input: &str) -> Result<SessionDescription, SdpError> {
     let origin = origin.ok_or(SdpError::Invalid("missing origin"))?;
     let connection_address = address.ok_or(SdpError::Invalid("missing address"))?;
     let port = media_port.ok_or(SdpError::Invalid("missing media port"))?;
-    let payload_type = payload_type.ok_or(SdpError::Invalid("missing payload type"))?;
+    
+    if !saw_pcmu {
+        return Err(SdpError::Invalid("no supported codec (PCMU/8000) in SDP"));
+    }
 
-    Ok(SessionDescription {
+    let payload_type = pcmu_pt.ok_or(SdpError::Invalid("missing PCMU payload type"))?;
+
+    let sdp = SessionDescription {
         origin,
         connection_address,
         media: MediaDescription {
             port,
             payload_type,
             codec: Codec::Pcmu,
-        },
-    })
+        }
+    };
+
+    log::debug!("parsed:\r\n{:#?}", sdp);
+
+    Ok(sdp)
 }
 
 #[cfg(test)]

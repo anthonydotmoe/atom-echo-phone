@@ -1,4 +1,5 @@
 use core::fmt::Write;
+use core::mem;
 
 use crate::{
     header_value,
@@ -6,14 +7,26 @@ use crate::{
     Result, SipError,
 };
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DialogState {
-    #[default]
     Idle,
-    Inviting,
-    Ringing,
-    Established,
+    Inviting, // UAC side, INVITE sent, no confirmed dialog yet
+    Ringing {
+        role: DialogRole,
+        id: SipDialogId,
+        original_invite: Request,
+    },
+    Established {
+        role: DialogRole,
+        id: SipDialogId,
+    },
     Terminated,
+}
+
+impl Default for DialogState {
+    fn default() -> Self {
+        DialogState::Idle
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,11 +42,14 @@ pub struct SipDialogId {
     pub remote_tag: String,
 }
 
+pub struct CancelResult {
+    pub cancel_ok: Response,
+    pub maybe_invite_487: Option<Response>,
+}
+
 #[derive(Debug, Default)]
 pub struct Dialog {
     pub state: DialogState,
-    pub role: Option<DialogRole>,
-    pub id: Option<SipDialogId>,
     pub cseq: u32,
     next_tag_counter: u32,
 }
@@ -42,8 +58,6 @@ impl Dialog {
     pub fn new() -> Self {
         Self {
             state: DialogState::Idle,
-            role: None,
-            id: None,
             cseq: 0,
             next_tag_counter: 1,
         }
@@ -57,13 +71,28 @@ impl Dialog {
         tag
     }
 
+    /// Small helpers so the rest of the code doesn't have to pattern-match
+    /// on `DialogState` over and over.
+    fn id_mut(&mut self) -> Option<&mut SipDialogId> {
+        match &mut self.state {
+            DialogState::Ringing { id, .. } | DialogState::Established { id, .. } => Some(id),
+            _ => None,
+        }
+    }
+
+    fn id_ref(&self) -> Option<&SipDialogId> {
+        match &self.state {
+            DialogState::Ringing { id, .. } | DialogState::Established { id, .. } => Some(id),
+            _ => None,
+        }
+    }
+
     /// Start an outgoing INVITE (UAC side).
     pub fn start_outgoing(&mut self, target: &str) -> Result<Request> {
         if self.state != DialogState::Idle && self.state != DialogState::Terminated {
             return Err(SipError::InvalidState("dialog busy"));
         }
         self.state = DialogState::Inviting;
-        self.role = Some(DialogRole::Uac);
         self.cseq = self.cseq.wrapping_add(1);
 
         let mut req = Request::new(Method::Invite, target)?;
@@ -74,25 +103,8 @@ impl Dialog {
         Ok(req)
     }
 
-    pub fn handle_final_response(&mut self, status: u16) -> Option<Request> {
-        match status {
-            180 | 183 => {
-                self.state = DialogState::Ringing;
-                None
-            }
-            200 => {
-                self.state = DialogState::Established;
-                self.build_ack().ok()
-            }
-            _ => {
-                self.state = DialogState::Terminated;
-                None
-            }
-        }
-    }
-
     pub fn build_bye(&mut self, target: &str) -> Option<Request> {
-        if self.state != DialogState::Established {
+        if !matches!(self.state, DialogState::Established { .. }) {
             return None;
         }
         self.cseq = self.cseq.wrapping_add(1);
@@ -160,31 +172,34 @@ impl Dialog {
             .ok_or(SipError::Invalid("missing To"))?;
         to_value.push_str(raw_to);
 
+        // Decide whether we need to add a tag
         if !raw_to.to_ascii_lowercase().contains("tag=") {
-            let local_tag = self.allocate_tag();
-            if !to_value.contains(";") {
-                to_value.push_str(";tag=");
-            } else {
-                to_value.push_str(";tag=");
-            }
-            to_value
-                .push_str(local_tag.as_str());
+            // We'll decide which tag to use then append once.
+            let tag_to_use;
 
-            // store dialog id if we haven't yet
-            if self.id.is_none() {
-                let mut cid = String::new();
-                cid.push_str(call_id);
-                let mut local = String::new();
-                local
-                    .push_str(local_tag.as_str());
-                // remote tag comes from From header if present; for now we just leave it empty.
-                let remote = String::new();
-                self.id = Some(SipDialogId {
-                    call_id: cid,
-                    local_tag: local,
-                    remote_tag: remote,
-                });
-                self.role = Some(DialogRole::Uas);
+            let new_tag = self.allocate_tag();
+            if let Some(id) = self.id_mut() {
+                if id.call_id == call_id {
+                    // This response belongs to our current dialog
+                    if id.local_tag.is_empty() {
+                        // First time we're adding a tag for this dialog
+                        id.local_tag.clear();
+                        id.local_tag.push_str(new_tag.as_str());
+                    }
+
+                    tag_to_use = Some(id.local_tag.clone());
+                } else {
+                    // Some other transaction; generate a one-off tag
+                    tag_to_use = Some(self.allocate_tag());
+                }
+            } else {
+                // No dialog state at all (e.g., standalone response)
+                tag_to_use = Some(self.allocate_tag());
+            }
+
+            if let Some(tag) = tag_to_use {
+                to_value.push_str(";tag=");
+                to_value.push_str(tag.as_str());
             }
         }
 
@@ -212,13 +227,9 @@ impl Dialog {
 
         // try to extract tag from From: ...;tag=foo
         let remote_tag = parse_tag_param(from).unwrap_or("remote");
-        let local_tag = "local"; // will be assigned when building responses
 
         let mut cid = String::new();
         cid.push_str(call_id);
-
-        let mut local = String::new();
-        local.push_str(local_tag);
 
         let mut remote = String::new();
         remote
@@ -226,15 +237,71 @@ impl Dialog {
 
         let id = SipDialogId {
             call_id: cid,
-            local_tag: local,
+            local_tag: String::new(),
             remote_tag: remote,
         };
 
-        self.id = Some(id.clone());
-        self.role = Some(DialogRole::Uas);
-        self.state = DialogState::Ringing;
+        self.state = DialogState::Ringing {
+            id: id.clone(),
+            role: DialogRole::Uas,
+            original_invite: req.clone(),
+        };
 
         Ok(id)
+    }
+
+    /// Checks current call status. If incoming CANCEL matches the current call,
+    /// transision to Terminated
+    pub fn handle_incoming_cancel(&mut self, cancel_req: &Request) -> Result<CancelResult> {
+        // Take the current state out so we can move from it.
+        let old_state = mem::replace(&mut self.state, DialogState::Idle);
+
+        // Only meaningful if we are ringing as UAS
+        let (role, id, original_invite) = match old_state {
+            DialogState::Ringing { role, id, original_invite }  => (role, id, original_invite),
+            other => {
+                // Restore state
+                self.state = other;
+                return Err(SipError::InvalidState(
+                    "received CANCEL while not ringing",
+                ))
+            }
+        };
+
+        if role != DialogRole::Uas {
+            // Restore state if we somehow weren't UAS
+            self.state = DialogState::Ringing { role, id, original_invite };
+            return Err(SipError::InvalidState(
+                "received CANCEL but we are not UAS",
+            ));
+        }
+
+        let cancel_call_id = header_value(&cancel_req.headers, "Call-ID")
+            .ok_or(SipError::Invalid("missing Call-ID"))?;
+        let cancel_from = header_value(&cancel_req.headers, "From")
+            .ok_or(SipError::Invalid("missing From"))?;
+        // try to extract tag from From: ...;tag=foo
+        let cancel_remote_tag = parse_tag_param(cancel_from).unwrap_or("remote");
+
+        // Same Call-ID and same remote tag -> this CANCEL is for our dialog
+        if cancel_call_id != id.call_id || cancel_remote_tag != id.remote_tag {
+            return Err(SipError::Invalid("CANCEL does not match current dialog"));
+        }
+        
+        // 200 OK to the CANCEL itself
+        let cancel_ok =
+            self.build_response_for_request(cancel_req, 200, "OK", None)?;
+        
+        // 487 to the original INVITE
+        let invite_487 =
+            self.build_response_for_request(&original_invite, 487, "Request Terminated", None)?;
+        
+        self.state = DialogState::Terminated;
+
+        Ok(CancelResult {
+            cancel_ok,
+            maybe_invite_487: Some(invite_487),
+        })
     }
 }
 

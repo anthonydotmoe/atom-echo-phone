@@ -1,6 +1,6 @@
 use std::io::ErrorKind::WouldBlock;
 use std::net::{SocketAddr, UdpSocket};
-use std::thread;
+use std::{mem, thread};
 use std::time::{Duration, Instant};
 
 use heapless::String as HString;
@@ -38,6 +38,21 @@ pub fn spawn_sip_task(
     .expect("failed to spawn SIP task")
 }
 
+#[derive(Debug, Default)]
+enum CallState {
+    #[default]
+    Idle,
+    Ringing {
+        invite: sip_core::Request,
+        remote_sdp: sdp::SessionDescription,
+        ring_deadline: Instant,
+    },
+    Established {
+        invite: sip_core::Request,
+        remote_sdp: sdp::SessionDescription,
+    },
+}
+
 struct SipTask {
     // App wiring
     settings: &'static crate::settings::Settings,
@@ -48,6 +63,8 @@ struct SipTask {
 
     // Core SIP logic
     core: SipStack,
+    call_state: CallState,
+    ring_timeout: Duration,
 
     // Networking
     rx_buf: [u8; 1500],
@@ -104,6 +121,8 @@ impl SipTask {
             rtp_rx_tx,
 
             core,
+            call_state: CallState::Idle,
+            ring_timeout: Duration::from_secs(settings.ring_timeout as u64),
 
             rx_buf: [0u8; 1500],
             sip_socket,
@@ -128,12 +147,11 @@ impl SipTask {
 
             self.maybe_send_register(now);
             self.poll_sip_socket();
-
-
             if !self.poll_commands() {
                 log::info!("SIP task exiting: command channel closed");
                 break;
             }
+            self.check_call_timeouts(now);
 
             thread::sleep(Duration::from_millis(10));
         }
@@ -265,10 +283,16 @@ impl SipTask {
             match self.sip_socket.recv_from(&mut self.rx_buf) {
                 Ok((len, addr)) => {
                     if let Ok(text) = core::str::from_utf8(&self.rx_buf[..len]) {
-                        if let Ok(msg) = sip_core::parse_message(text) {
-                            let events = self.core.on_message(msg);
-                            for ev in events {
-                                self.handle_core_event(ev, addr);
+                        log::debug!("parse_message:\r\n{}", text);
+                        match sip_core::parse_message(text) {
+                            Ok(msg) => {
+                                let events = self.core.on_message(msg);
+                                for ev in events {
+                                    self.handle_core_event(ev, addr);
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("parse_message: {:?}", e);
                             }
                         }
 
@@ -288,6 +312,14 @@ impl SipTask {
             CoreEvent::Registration(reg_ev) => self.handle_reg_event(reg_ev),
             CoreEvent::Dialog(dialog_ev) => {
                 self.handle_dialog_event(dialog_ev, remote_addr)
+            }
+            CoreEvent::SendResponse(resp) => {
+                if let Ok(text) = resp.render() {
+                    log::debug!("Sending response:\r\n{}", text);
+                    send_sip(&self.sip_socket, &self.registrar, &text);
+                } else {
+                    log::warn!("Failed to render response");
+                }
             }
         }
     }
@@ -326,56 +358,122 @@ impl SipTask {
     }
 
     fn on_incoming_invite(&mut self, req: sip_core::Request) {
-        // Very simple SDP offer handling:
-        // - Parse remote SDP from INVITE body.
-        // - Start RTP TX/RX toward the address/port in the SDP.
-        //
-        // TODO: Answer (200 OK)
-
         if req.body.is_empty() {
-            log::warn!("INVITE had no SDP body; ignoring for now");
+            log::warn!("INVITE had no SDP body; ignoring");
             return;
         }
 
-        let sdp_text = req.body.as_str();
-        let sdp = match sdp::parse(sdp_text) {
+        let sdp = match sdp::parse(req.body.as_str()) {
             Ok(s) => s,
             Err(e) => {
                 log::warn!("failed to parse SDP: {:?}", e);
+                if let Err(e) =
+                    self.send_response_488_not_acceptable_here(&req)
+                {
+                    log::warn!("Failed to send 488 Not Acceptable Here: {:?}", e);
+                }
                 return;
             }
         };
 
-        // Decide where to send RTP
-        let remote_ip = sdp.connection_address.clone();
-        let remote_port = sdp.media.port;
+        let now = Instant::now();
+        let ring_deadline = now + self.ring_timeout;
 
         log::info!(
-            "SDP offer: remote RTP {}:{} (local RTP port {})",
-            remote_ip, remote_port, self.local_rtp_port
+            "Incoming INVITE: remote RTP {}:{}, ring timeout {:?}",
+            sdp.connection_address,
+            sdp.media.port,
+            self.ring_timeout,
         );
 
-        // Kick RTP threads
-        let mut ip = HString::<48>::new();
-        if let Err(_) = ip.push_str(&remote_ip) {
-            log::error!("Couldn't push remote IP to RtpCommand");
-        }
+        // Send 180 Ringing
+        self.send_response_180_ringing(&req);
 
-        let _ = self.rtp_tx_tx.send(RtpTxCommand::StartStream {
-            remote_ip: ip,
-            remote_port,
-            ssrc: random_u32(),
-            payload_type: sdp.media.payload_type,
-        });
+        // Tell UI
+        //TODO: let _ = self.ui_tx.send(UiCommand::SetLed::Ringing);
 
-        let _ = self.rtp_rx_tx.send(RtpRxCommand::StartStream {
-            expected_ssrc: 0, // TODO: configure
-            payload_type: sdp.media.payload_type,
-        });
+        // Store state
+        self.call_state = CallState::Ringing {
+            invite: req,
+            remote_sdp: sdp,
+            ring_deadline,
+        };
+    }
 
-        //TODO: Extend this by
-        // - Building 180 Ringing and 200 OK via core.dialog.build_response_for_request(...)
-        // - Rendering and sending them via send_sip().
+    // --- Network responses ---------------------------------------------------
+
+    fn send_response_180_ringing(&mut self, invite: &sip_core::Request) -> Result<(), sip_core::SipError> {
+        let resp = self
+            .core
+            .dialog
+            .build_response_for_request(invite, 180, "Ringing", None)?;
+
+        let text = resp.render()?;
+        log::debug!("Sending 180 Ringing:\r\n{}", text);
+        send_sip(&self.sip_socket, &self.registrar, &text);
+        Ok(())
+    }
+
+    fn send_response_200_ok_with_sdp(
+        &mut self,
+        invite: &sip_core::Request,
+        local_sdp: &sdp::SessionDescription,
+    ) -> Result<(), sip_core::SipError> {
+        let body = local_sdp.render().unwrap_or_default();
+        let resp = self
+            .core
+            .dialog
+            .build_response_for_request(invite, 200, "OK", Some(&body))?;
+
+        let text = resp.render()?;
+        log::debug!("Sending 200 OK:\r\n{}", text);
+        send_sip(&self.sip_socket, &self.registrar, &text);
+        Ok(())
+    }
+
+    fn send_response_488_not_acceptable_here(
+        &mut self,
+        invite: &sip_core::Request,
+    ) -> Result<(), sip_core::SipError> {
+        let resp = self
+            .core
+            .dialog
+            .build_response_for_request(invite, 488, "Not Acceptable Here", None)?;
+
+        let text = resp.render()?;
+        log::debug!("Sending 488 Not Acceptable Here:\r\n{}", text);
+        send_sip(&self.sip_socket, &self.registrar, &text);
+        Ok(())
+    }
+
+    fn send_response_486_busy_here(
+        &mut self,
+        invite: &sip_core::Request,
+    ) -> Result<(), sip_core::SipError> {
+        let resp = self
+            .core
+            .dialog
+            .build_response_for_request(invite, 486, "Busy Here", None)?;
+
+        let text = resp.render()?;
+        log::debug!("Sending 486 Busy Here:\r\n{}", text);
+        send_sip(&self.sip_socket, &self.registrar, &text);
+        Ok(())
+    }
+
+    fn send_response_480_temporarily_unavailable(
+        &mut self,
+        invite: &sip_core::Request,
+    ) -> Result<(), sip_core::SipError> {
+        let resp = self
+            .core
+            .dialog
+            .build_response_for_request(invite, 480, "Temporarily Unavailable", None)?;
+
+        let text = resp.render()?;
+        log::debug!("Sending 480 Temporarily Unavailable:\r\n{}", text);
+        send_sip(&self.sip_socket, &self.registrar, &text);
+        Ok(())
     }
 
     // --- Commands from UI / other tasks --------------------------------------
@@ -407,6 +505,34 @@ impl SipTask {
         // - self.core.dialog.start_outgoing(...)
         // - self.core.dialog.build_bye(...)
         // - plus RTP commands and UI updates.
+    }
+
+    fn answer_call(&mut self) {}
+
+    fn end_call(&mut self) {
+        self.call_state = CallState::Idle;
+    }
+
+    fn check_call_timeouts(&mut self, now: Instant) {
+        // Take current state so we can move from it
+        let old_state = mem::replace(&mut self.call_state, CallState::Idle);
+
+        let (ring_deadline, invite) = match old_state {
+            CallState::Ringing { ref ring_deadline, ref invite, .. } => (ring_deadline, invite),
+            _ => {
+                // No timeout, restore state
+                self.call_state = old_state;
+                return;
+            }
+        };
+
+        if now >= *ring_deadline {
+            log::info!("Ringing timed out: sending 480 and returning to idle");
+            self.send_response_480_temporarily_unavailable(&invite);
+            self.end_call();
+        } else {
+            self.call_state = old_state;
+        }
     }
 }
 
