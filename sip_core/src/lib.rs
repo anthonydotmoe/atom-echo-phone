@@ -11,8 +11,7 @@ mod stack;
 
 pub use crate::message::{
     header_value, parse_message, Header, HeaderList, Method, Message, Request,
-    Response, Version, SmallString, MAX_BODY_LEN, MAX_CALL_ID_LEN,
-    MAX_HEADER_NAME, MAX_HEADER_VALUE, MAX_REASON_LEN, MAX_TAG_LEN, MAX_URI_LEN,
+    Response, Version,
 };
 
 pub use crate::auth::{
@@ -46,17 +45,3 @@ pub enum SipError {
 }
 
 pub type Result<T> = core::result::Result<T, SipError>;
-
-// --- Stack size logging facility ---------------------------------------------
-extern "C" {
-    fn uxTaskGetStackHighWaterMark(handle: *mut core::ffi::c_void) -> u32;
-}
-
-pub fn log_stack_high_water(msg: &'static str) {
-    unsafe {
-        // NULL -> "current task"
-        let words_left = uxTaskGetStackHighWaterMark(core::ptr::null_mut());
-        let bytes_left = words_left as usize * core::mem::size_of::<usize>();
-        log::info!("{}: min remaining stack: {} bytes", msg, bytes_left);
-    }
-}

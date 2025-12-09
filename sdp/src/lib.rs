@@ -1,12 +1,5 @@
 use core::fmt::Write;
-use heapless::{String, Vec};
 use thiserror::Error;
-
-const MAX_ORIGIN_LEN: usize = 48;
-const MAX_ADDR_LEN: usize = 48;
-const MAX_SDP_LEN: usize = 256;
-
-pub type SmallString<const N: usize> = String<N>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Codec {
@@ -22,8 +15,8 @@ pub struct MediaDescription {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionDescription {
-    pub origin: SmallString<MAX_ORIGIN_LEN>,
-    pub connection_address: SmallString<MAX_ADDR_LEN>,
+    pub origin: String,
+    pub connection_address: String,
     pub media: MediaDescription,
 }
 
@@ -37,13 +30,12 @@ pub enum SdpError {
 
 impl SessionDescription {
     pub fn offer(origin: &str, address: &str, port: u16) -> Result<Self, SdpError> {
-        let mut origin_buf: SmallString<MAX_ORIGIN_LEN> = SmallString::new();
-        origin_buf.push_str(origin).map_err(|_| SdpError::Capacity)?;
+        let mut origin_buf = String::new();
+        origin_buf.push_str(origin);
 
-        let mut address_buf: SmallString<MAX_ADDR_LEN> = SmallString::new();
+        let mut address_buf = String::new();
         address_buf
-            .push_str(address)
-            .map_err(|_| SdpError::Capacity)?;
+            .push_str(address);
 
         Ok(Self {
             origin: origin_buf,
@@ -66,8 +58,8 @@ impl SessionDescription {
         SessionDescription::offer(&self.origin, address, port)
     }
 
-    pub fn render(&self) -> Result<SmallString<MAX_SDP_LEN>, SdpError> {
-        let mut out: SmallString<MAX_SDP_LEN> = SmallString::new();
+    pub fn render(&self) -> Result<String, SdpError> {
+        let mut out = String::new();
         writeln!(out, "v=0").map_err(|_| SdpError::Capacity)?;
         
         //TODO: "session ID" and "session version" should not both be `0`,
@@ -90,10 +82,12 @@ impl SessionDescription {
 }
 
 pub fn parse(input: &str) -> Result<SessionDescription, SdpError> {
-    let mut origin: Option<SmallString<MAX_ORIGIN_LEN>> = None;
-    let mut address: Option<SmallString<MAX_ADDR_LEN>> = None;
+    let mut origin: Option<String> = None;
+    let mut address: Option<String> = None;
     let mut media_port: Option<u16> = None;
     let mut payload_type: Option<u8> = None;
+
+    log::info!("parse:\r\n{}", input);
 
     for raw_line in input.lines() {
         let line = raw_line.trim_end_matches('\r');
@@ -107,25 +101,25 @@ pub fn parse(input: &str) -> Result<SessionDescription, SdpError> {
 
         match prefix {
             "o" => {
-                let fields: Vec<&str, 6> = rest.split_whitespace().collect();
+                let fields: Vec<&str> = rest.split_whitespace().collect();
                 if fields.len() < 6 {
                     return Err(SdpError::Invalid("origin line"));
                 }
-                let mut buf: SmallString<MAX_ORIGIN_LEN> = SmallString::new();
-                buf.push_str(fields[0]).map_err(|_| SdpError::Capacity)?;
+                let mut buf = String::new();
+                buf.push_str(fields[0]);
                 origin = Some(buf);
             }
             "c" => {
-                let fields: Vec<&str, 3> = rest.split_whitespace().collect();
+                let fields: Vec<&str> = rest.split_whitespace().collect();
                 if fields.len() != 3 {
                     return Err(SdpError::Invalid("connection line"));
                 }
-                let mut buf: SmallString<MAX_ADDR_LEN> = SmallString::new();
-                buf.push_str(fields[2]).map_err(|_| SdpError::Capacity)?;
+                let mut buf = String::new();
+                buf.push_str(fields[2]);
                 address = Some(buf);
             }
             "m" => {
-                let fields: Vec<&str, 4> = rest.split_whitespace().collect();
+                let fields: Vec<&str> = rest.split_whitespace().collect();
                 if fields.len() < 4 || fields[0] != "audio" {
                     return Err(SdpError::Invalid("media line"));
                 }
@@ -134,17 +128,22 @@ pub fn parse(input: &str) -> Result<SessionDescription, SdpError> {
             }
             "a" => {
                 if rest.starts_with("rtpmap:") {
-                    let mut comps = rest["rtpmap:".len()..].split_whitespace();
+                    // rest is like "rtpmap:0 PCMU/8000" or "rtpmap:101 telephone-event/8000"
+                    let after = &rest["rtpmap:".len()..];
+                    let mut comps = after.split_whitespace();
                     let pt = comps
                         .next()
                         .ok_or(SdpError::Invalid("rtpmap payload"))?;
                     let codec = comps
                         .next()
                         .ok_or(SdpError::Invalid("rtpmap codec"))?;
-                    if !codec.eq_ignore_ascii_case("PCMU/8000") {
-                        return Err(SdpError::Invalid("codec"));
+
+                    // We only support PCMU/8000; ignore other codecs.
+                    if codec.to_ascii_uppercase().starts_with("PCMU/8000") {
+                        payload_type = pt.parse().ok();
+                    } else {
+                        // Ignore telephone-event, G722, etc.
                     }
-                    payload_type = pt.parse().ok();
                 }
             }
             _ => {}

@@ -3,7 +3,7 @@ use core::fmt::Write;
 use crate::{
     header_value,
     message::{Header, Method, Request, Response},
-    Result, SipError, SmallString, MAX_CALL_ID_LEN, MAX_HEADER_VALUE, MAX_TAG_LEN,
+    Result, SipError,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -24,9 +24,9 @@ pub enum DialogRole {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SipDialogId {
-    pub call_id: SmallString<MAX_CALL_ID_LEN>,
-    pub local_tag: SmallString<MAX_TAG_LEN>,
-    pub remote_tag: SmallString<MAX_TAG_LEN>,
+    pub call_id: String,
+    pub local_tag: String,
+    pub remote_tag: String,
 }
 
 #[derive(Debug, Default)]
@@ -49,8 +49,8 @@ impl Dialog {
         }
     }
 
-    fn allocate_tag(&mut self) -> SmallString<MAX_TAG_LEN> {
-        let mut tag = SmallString::<MAX_TAG_LEN>::new();
+    fn allocate_tag(&mut self) -> String {
+        let mut tag = String::new();
         let idx = self.next_tag_counter;
         self.next_tag_counter = self.next_tag_counter.wrapping_add(1);
         let _ = write!(tag, "dlg{:x}", idx);
@@ -111,7 +111,7 @@ impl Dialog {
     }
 
     fn cseq_header(&self, method: &str) -> Result<Header> {
-        let mut value: SmallString<MAX_HEADER_VALUE> = SmallString::new();
+        let mut value = String::new();
         write!(value, "{} {}", self.cseq, method).map_err(|_| SipError::Capacity)?;
         Header::new("CSeq", &value)
     }
@@ -134,7 +134,7 @@ impl Dialog {
 
         // Via: copy as-is
         if let Some(via) = header_value(&req.headers, "Via") {
-            resp.add_header(Header::new("Via", via)?)?;
+            resp.add_header(Header::new("Via", via)?);
         } else {
             return Err(SipError::Invalid("missing Via"));
         }
@@ -142,45 +142,43 @@ impl Dialog {
         // Call-ID
         let call_id = header_value(&req.headers, "Call-ID")
             .ok_or(SipError::Invalid("missing Call-ID"))?;
-        resp.add_header(Header::new("Call-ID", call_id)?)?;
+        resp.add_header(Header::new("Call-ID", call_id)?);
 
         // CSeq
         let cseq = header_value(&req.headers, "CSeq")
             .ok_or(SipError::Invalid("missing CSeq"))?;
-        resp.add_header(Header::new("CSeq", cseq)?)?;
+        resp.add_header(Header::new("CSeq", cseq)?);
 
         // From
         let from = header_value(&req.headers, "From")
             .ok_or(SipError::Invalid("missing From"))?;
-        resp.add_header(Header::new("From", from)?)?;
+        resp.add_header(Header::new("From", from)?);
 
         // To: ensure it has a tag
-        let mut to_value: SmallString<MAX_HEADER_VALUE> = SmallString::new();
+        let mut to_value = String::new();
         let raw_to = header_value(&req.headers, "To")
             .ok_or(SipError::Invalid("missing To"))?;
-        to_value.push_str(raw_to).map_err(|_| SipError::Capacity)?;
+        to_value.push_str(raw_to);
 
         if !raw_to.to_ascii_lowercase().contains("tag=") {
             let local_tag = self.allocate_tag();
             if !to_value.contains(";") {
-                to_value.push_str(";tag=").map_err(|_| SipError::Capacity)?;
+                to_value.push_str(";tag=");
             } else {
-                to_value.push_str(";tag=").map_err(|_| SipError::Capacity)?;
+                to_value.push_str(";tag=");
             }
             to_value
-                .push_str(local_tag.as_str())
-                .map_err(|_| SipError::Capacity)?;
+                .push_str(local_tag.as_str());
 
             // store dialog id if we haven't yet
             if self.id.is_none() {
-                let mut cid: SmallString<MAX_CALL_ID_LEN> = SmallString::new();
-                cid.push_str(call_id).map_err(|_| SipError::Capacity)?;
-                let mut local: SmallString<MAX_TAG_LEN> = SmallString::new();
+                let mut cid = String::new();
+                cid.push_str(call_id);
+                let mut local = String::new();
                 local
-                    .push_str(local_tag.as_str())
-                    .map_err(|_| SipError::Capacity)?;
+                    .push_str(local_tag.as_str());
                 // remote tag comes from From header if present; for now we just leave it empty.
-                let remote = SmallString::<MAX_TAG_LEN>::new();
+                let remote = String::new();
                 self.id = Some(SipDialogId {
                     call_id: cid,
                     local_tag: local,
@@ -190,15 +188,15 @@ impl Dialog {
             }
         }
 
-        resp.add_header(Header::new("To", &to_value)?)?;
+        resp.add_header(Header::new("To", &to_value)?);
 
         // Content-Length / body
         if let Some(b) = body {
-            resp.set_body(b)?;
+            resp.set_body(b);
             let len_str = b.len().to_string();
-            resp.add_header(Header::new("Content-Length", &len_str)?)?;
+            resp.add_header(Header::new("Content-Length", &len_str)?);
         } else {
-            resp.add_header(Header::new("Content-Length", "0")?)?;
+            resp.add_header(Header::new("Content-Length", "0")?);
         }
 
         Ok(resp)
@@ -216,16 +214,15 @@ impl Dialog {
         let remote_tag = parse_tag_param(from).unwrap_or("remote");
         let local_tag = "local"; // will be assigned when building responses
 
-        let mut cid: SmallString<MAX_CALL_ID_LEN> = SmallString::new();
-        cid.push_str(call_id).map_err(|_| SipError::Capacity)?;
+        let mut cid = String::new();
+        cid.push_str(call_id);
 
-        let mut local: SmallString<MAX_TAG_LEN> = SmallString::new();
-        local.push_str(local_tag).map_err(|_| SipError::Capacity)?;
+        let mut local = String::new();
+        local.push_str(local_tag);
 
-        let mut remote: SmallString<MAX_TAG_LEN> = SmallString::new();
+        let mut remote = String::new();
         remote
-            .push_str(remote_tag)
-            .map_err(|_| SipError::Capacity)?;
+            .push_str(remote_tag);
 
         let id = SipDialogId {
             call_id: cid,

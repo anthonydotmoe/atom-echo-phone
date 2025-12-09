@@ -1,18 +1,6 @@
 use core::fmt::Write;
-use heapless::{String, Vec};
 
 use crate::{Result, SipError};
-
-pub const MAX_URI_LEN: usize = 32;
-pub const MAX_HEADER_NAME: usize = 32;
-pub const MAX_HEADER_VALUE: usize = 128;
-pub const MAX_REASON_LEN: usize = 64;
-pub const MAX_BODY_LEN: usize = 1024;
-pub const MAX_HEADERS: usize = 16;
-pub const MAX_TAG_LEN: usize = 32;
-pub const MAX_CALL_ID_LEN: usize = 64;
-
-pub type SmallString<const N: usize> = String<N>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
@@ -34,28 +22,28 @@ impl Version {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
-    pub name: SmallString<MAX_HEADER_NAME>,
-    pub value: SmallString<MAX_HEADER_VALUE>,
+    pub name: String,
+    pub value: String,
 }
 
-pub type HeaderList = Vec<Header, MAX_HEADERS>;
+pub type HeaderList = Vec<Header>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     pub method: Method,
-    pub uri: SmallString<MAX_URI_LEN>,
+    pub uri: String,
     pub version: Version,
-    pub headers: HeaderList,
-    pub body: SmallString<MAX_BODY_LEN>,
+    pub headers: Vec<Header>,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Response {
     pub version: Version,
     pub status_code: u16,
-    pub reason: SmallString<MAX_REASON_LEN>,
+    pub reason: String,
     pub headers: HeaderList,
-    pub body: SmallString<MAX_BODY_LEN>,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,10 +54,10 @@ pub enum Message {
 
 impl Header {
     pub fn new(name: &str, value: &str) -> Result<Self> {
-        let mut name_buf: SmallString<MAX_HEADER_NAME> = SmallString::new();
-        name_buf.push_str(name).map_err(|_| SipError::Capacity)?;
-        let mut value_buf: SmallString<MAX_HEADER_VALUE> = SmallString::new();
-        value_buf.push_str(value).map_err(|_| SipError::Capacity)?;
+        let mut name_buf = String::new();
+        name_buf.push_str(name);
+        let mut value_buf = String::new();
+        value_buf.push_str(value);
         Ok(Header {
             name: name_buf,
             value: value_buf,
@@ -79,29 +67,31 @@ impl Header {
 
 impl Request {
     pub fn new(method: Method, uri: &str) -> Result<Self> {
-        let mut uri_buf: SmallString<MAX_URI_LEN> = SmallString::new();
-        uri_buf.push_str(uri).map_err(|_| SipError::Capacity)?;
+        let mut uri_buf = String::new();
+        uri_buf.push_str(uri);
 
         Ok(Self {
             method,
             uri: uri_buf,
             version: Version::SIP_2_0,
             headers: HeaderList::new(),
-            body: SmallString::new(),
+            body: String::new(),
         })
     }
 
     pub fn add_header(&mut self, header: Header) -> Result<()> {
-        self.headers.push(header).map_err(|_| SipError::Capacity)
+        self.headers.push(header);
+        Ok(())
     }
 
     pub fn set_body(&mut self, body: &str) -> Result<()> {
         self.body.clear();
-        self.body.push_str(body).map_err(|_| SipError::Capacity)
+        self.body.push_str(body);
+        Ok(())
     }
 
-    pub fn render<const N: usize>(&self) -> Result<SmallString<N>> {
-        let mut out: SmallString<N> = SmallString::new();
+    pub fn render(&self) -> Result<String> {
+        let mut out = String::new();
         write!(
             out,
             "{} {} SIP/{}.{}\r\n",
@@ -119,31 +109,29 @@ impl Request {
 
 impl Response {
     pub fn new(status_code: u16, reason: &str) -> Result<Self> {
-        let mut reason_buf: SmallString<MAX_REASON_LEN> = SmallString::new();
-        reason_buf
-            .push_str(reason)
-            .map_err(|_| SipError::Capacity)?;
+        let mut reason_buf = String::new();
+        reason_buf.push_str(reason);
 
         Ok(Self {
             version: Version::SIP_2_0,
             status_code,
             reason: reason_buf,
             headers: HeaderList::new(),
-            body: SmallString::new(),
+            body: String::new(),
         })
     }
 
-    pub fn add_header(&mut self, header: Header) -> Result<()> {
-        self.headers.push(header).map_err(|_| SipError::Capacity)
+    pub fn add_header(&mut self, header: Header) {
+        self.headers.push(header);
     }
 
-    pub fn set_body(&mut self, body: &str) -> Result<()> {
+    pub fn set_body(&mut self, body: &str) {
         self.body.clear();
-        self.body.push_str(body).map_err(|_| SipError::Capacity)
+        self.body.push_str(body);
     }
 
-    pub fn render<const N: usize>(&self) -> Result<SmallString<N>> {
-        let mut out: SmallString<N> = SmallString::new();
+    pub fn render(&self) -> Result<String> {
+        let mut out = String::new();
         write!(
             out,
             "SIP/{}.{} {} {}\r\n",
@@ -212,12 +200,12 @@ where
         .parse()
         .map_err(|_| SipError::Invalid("status parse"))?;
 
-    let mut reason: SmallString<MAX_REASON_LEN> = SmallString::new();
+    let mut reason = String::new();
     for part in parts {
         if !reason.is_empty() {
-            reason.push(' ').map_err(|_| SipError::Capacity)?;
+            reason.push(' ');
         }
-        reason.push_str(part).map_err(|_| SipError::Capacity)?;
+        reason.push_str(part);
     }
 
     let mut resp = Response::new(status, &reason)?;
@@ -228,7 +216,7 @@ where
 fn parse_headers_and_body<'a, I>(
     lines: &mut I,
     headers: &mut HeaderList,
-    body: &mut SmallString<MAX_BODY_LEN>,
+    body: &mut String,
 ) -> Result<()>
 where
     I: Iterator<Item = &'a str>,
@@ -245,8 +233,7 @@ where
             .ok_or(SipError::Invalid("header value"))?
             .trim();
         headers
-            .push(Header::new(name, value)?)
-            .map_err(|_| SipError::Capacity)?;
+            .push(Header::new(name, value)?);
     }
 
     // Body
@@ -254,10 +241,10 @@ where
     let mut first = true;
     for line in lines {
         if !first {
-            body.push_str("\r\n").map_err(|_| SipError::Capacity)?;
+            body.push_str("\r\n");
         }
         first = false;
-        body.push_str(line).map_err(|_| SipError::Capacity)?;
+        body.push_str(line);
     }
 
     Ok(())
@@ -289,13 +276,12 @@ mod tests {
         let mut req = Request::new(Method::Invite, "sip:100@example.com").unwrap();
         req.add_header(Header::new("Via", "SIP/2.0/UDP 192.0.2.1").unwrap())
             .unwrap();
-        let rendered: SmallString<MAX_BODY_LEN> = req.render().unwrap();
+        let rendered = req.render().unwrap();
         assert!(rendered.starts_with("INVITE sip:100@example.com SIP/2.0"));
 
         let mut resp = Response::new(200, "OK").unwrap();
-        resp.add_header(Header::new("Content-Length", "0").unwrap())
-            .unwrap();
-        let rendered_resp: SmallString<MAX_BODY_LEN> = resp.render().unwrap();
+        resp.add_header(Header::new("Content-Length", "0").unwrap());
+        let rendered_resp = resp.render().unwrap();
         assert!(rendered_resp.starts_with("SIP/2.0 200 OK"));
     }
 

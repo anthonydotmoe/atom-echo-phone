@@ -1,13 +1,10 @@
-use heapless::Vec;
-
 use crate::{
-    Result, auth::DigestChallenge, dialog::{Dialog, DialogState, SipDialogId}, log_stack_high_water, message::{Message, Method, Request, Response, header_value}, registration::{RegistrationResult, RegistrationState, RegistrationTransaction}
+    Result, auth::DigestChallenge, dialog::{Dialog, DialogState, SipDialogId}, message::{Message, Method, Request, Response, header_value}, registration::{RegistrationResult, RegistrationState, RegistrationTransaction}
 };
-
-pub const MAX_EVENTS: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreRegistrationEvent {
+    Result(RegistrationResult),
     StateChanged(RegistrationState),
 }
 
@@ -46,7 +43,6 @@ impl SipStack {
         expires: u32,
         auth_header: Option<crate::message::Header>,
     ) -> Result<Request> {
-        log_stack_high_water("SipStack::build_register");
         self.registration
             .build_register(registrar_uri, contact_uri, via_host, via_port, expires, auth_header)
     }
@@ -55,7 +51,7 @@ impl SipStack {
     pub fn on_register_response(
         &mut self,
         resp: &Response,
-        events: &mut Vec<CoreEvent, MAX_EVENTS>,
+        events: &mut Vec<CoreEvent>,
     ) -> RegistrationResult {
         let result = self.registration.handle_response(resp);
         let state = self.registration.state();
@@ -63,7 +59,7 @@ impl SipStack {
         if state != self.last_reg_state {
             self.last_reg_state = state;
             let _ = events.push(CoreEvent::Registration(
-                CoreRegistrationEvent::StateChanged(state),
+                CoreRegistrationEvent::Result(result),
             ));
         }
 
@@ -78,13 +74,25 @@ impl SipStack {
     pub fn on_message(
         &mut self,
         msg: Message,
-    ) -> Vec<CoreEvent, MAX_EVENTS> {
-        let mut events: Vec<CoreEvent, MAX_EVENTS> = Vec::new();
+    ) -> Vec<CoreEvent> {
+        let mut events: Vec<CoreEvent> = Vec::new();
 
         match msg {
             Message::Response(resp) => {
                 if is_register_response(&resp) {
-                    let _ = self.on_register_response(&resp, &mut events);
+                    let res = self.registration.handle_response(&resp);
+
+                    // Emit the result so SipTask can schedule timers, etc.
+                    let _ = events.push(CoreEvent::Registration(
+                        CoreRegistrationEvent::Result(res),
+                    ));
+
+                    let state = self.registration.state();
+                    let _ = events.push(CoreEvent::Registration(
+                        CoreRegistrationEvent::StateChanged(state),
+                    ));
+
+                    return events;
                 } else {
                     // Outgoing dialog responses could be handled here too.
                     self.handle_non_register_response(&resp, &mut events);
@@ -105,7 +113,7 @@ impl SipStack {
     fn handle_non_register_response(
         &mut self,
         resp: &Response,
-        events: &mut Vec<CoreEvent, MAX_EVENTS>,
+        events: &mut Vec<CoreEvent>,
     ) {
         // Very small outgoing-call support:
         if let Some(cseq) = header_value(&resp.headers, "CSeq") {
@@ -123,7 +131,7 @@ impl SipStack {
     fn handle_incoming_invite(
         &mut self,
         req: Request,
-        events: &mut Vec<CoreEvent, MAX_EVENTS>,
+        events: &mut Vec<CoreEvent>,
     ) {
         // Classify as an incoming dialog; this will also set dialog state.
         if let Ok(dialog_id) = self.dialog.classify_incoming_invite(&req) {

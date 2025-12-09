@@ -9,8 +9,6 @@ use sdp::SessionDescription;
 use sip_core::{
     authorization_header, CoreDialogEvent, CoreEvent, CoreRegistrationEvent,
     DigestCredentials, RegistrationResult, RegistrationState, SipStack,
-
-    log_stack_high_water,
 };
 
 use crate::messages::{
@@ -20,7 +18,7 @@ use crate::messages::{
     SipCommand, SipCommandReceiver
 };
 
-const STACK_SIZE: usize = 64 * 1024;
+const STACK_SIZE: usize = 8 * 1024;
 
 pub fn spawn_sip_task(
     settings: &'static crate::settings::Settings,
@@ -30,7 +28,7 @@ pub fn spawn_sip_task(
     rtp_rx_tx: RtpRxCommandSender,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
-        .stack_size(STACK_SIZE)
+        //.stack_size(STACK_SIZE)
         .name("sip".into())
         .spawn(move || {
             let mut task = Box::new(
@@ -126,8 +124,6 @@ impl SipTask {
             self.local_ip, self.local_sip_port, self.local_rtp_port
         );
 
-        log_stack_high_water("run");
-
         loop {
             let now = Instant::now();
 
@@ -155,6 +151,7 @@ impl SipTask {
         }
 
         log::info!("Attempting SIP registration");
+        log_stack_high_water();
 
         // If already registered, keep the same Expires
         // otherwise use a small initial value.
@@ -176,10 +173,6 @@ impl SipTask {
                 self.local_sip_port,
             );
 
-        log::info!("contact uri: \"{}\"", contact_uri);
-
-        log_stack_high_water("after build_contact_uri");
-        
         let req = match self.core.build_register(
             self.settings.sip_registrar,
             &contact_uri,
@@ -196,9 +189,7 @@ impl SipTask {
             }
         };
 
-        log_stack_high_water("after build_register");
-
-        let rendered = match req.render::<512>() {
+        let rendered = match req.render() {
             Ok(s) => s,
             Err(e) => {
                 log::warn!("failed to render REGISTER: {:?}", e);
@@ -207,15 +198,11 @@ impl SipTask {
             }
         };
 
-        log_stack_high_water("after render");
-
         log::info!("sending REGISTER" /*\n{}", rendered*/ );
         send_sip(&self.sip_socket, &self.registrar, &rendered);
 
-        log_stack_high_water("after send_sip");
-
         // Give a short window for the first response
-        self.next_register = now + Duration::from_secs(5);
+        //self.next_register = now + Duration::from_secs(5);
     }
 
     fn build_auth_header(
@@ -259,12 +246,6 @@ impl SipTask {
                 // but we keep it for completeness.
             }
         }
-
-        let state = self.core.registration_state();
-        if state != self.last_reg_state {
-            self.last_reg_state = state;
-            log::info!("registration state -> {:?}", state);
-        }
     }
 
     // --- Network receive -----------------------------------------------------
@@ -303,9 +284,14 @@ impl SipTask {
 
     fn handle_reg_event(&mut self, ev: CoreRegistrationEvent) {
         match ev {
-            CoreRegistrationEvent::StateChanged(_state) => {
-                // We already update/notify in handle_registration_result.
-                // This hook is for additional behavior if needed.
+            CoreRegistrationEvent::Result(result) => {
+                self.handle_registration_result(result);
+            }
+            CoreRegistrationEvent::StateChanged(state) => {
+                if state != self.last_reg_state {
+                    self.last_reg_state = state;
+                    log::info!("registration state -> {:?}", state);
+                }
             }
         }
     }
@@ -361,18 +347,20 @@ impl SipTask {
 
         // Kick RTP threads
         let mut ip = HString::<48>::new();
-        let _ = ip.push_str(&remote_ip);
+        if let Err(_) = ip.push_str(&remote_ip) {
+            log::error!("Couldn't push remote IP to RtpCommand");
+        }
 
         let _ = self.rtp_tx_tx.send(RtpTxCommand::StartStream {
             remote_ip: ip,
             remote_port,
-            ssrc: 0,         //TODO: configure
-            payload_type: 0, // TODO: map from SDP
+            ssrc: get_new_ssrc(),
+            payload_type: sdp.media.payload_type,
         });
 
         let _ = self.rtp_rx_tx.send(RtpRxCommand::StartStream {
             expected_ssrc: 0, // TODO: configure
-            payload_type: 0,  // TODO: map from SDP
+            payload_type: sdp.media.payload_type,
         });
 
         //TODO: Extend this by
@@ -450,4 +438,23 @@ fn local_ip_port(sock: &UdpSocket) -> (String, u16) {
         .local_addr()
         .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
     (addr.ip().to_string(), addr.port())
+}
+
+fn get_new_ssrc() -> u32 {
+    use esp_idf_svc::sys::esp_random;
+    unsafe { esp_random() }
+}
+
+// --- Stack size logging facility ---------------------------------------------
+extern "C" {
+    fn uxTaskGetStackHighWaterMark(handle: *mut core::ffi::c_void) -> u32;
+}
+
+pub fn log_stack_high_water() {
+    unsafe {
+        // NULL -> "current task"
+        let words_left = uxTaskGetStackHighWaterMark(core::ptr::null_mut());
+        let bytes_left = words_left as usize * core::mem::size_of::<usize>();
+        log::info!("min remaining stack: {} bytes", bytes_left);
+    }
 }

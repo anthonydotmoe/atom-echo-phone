@@ -3,14 +3,14 @@ use core::fmt::Write;
 use md5::Digest;
 
 use crate::{
-    Header, Result, SipError, SmallString, MAX_HEADER_VALUE,
+    Header, Result, SipError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DigestChallenge {
-    pub realm: SmallString<MAX_HEADER_VALUE>,
-    pub nonce: SmallString<MAX_HEADER_VALUE>,
-    pub algorithm: SmallString<MAX_HEADER_VALUE>,
+    pub realm: String,
+    pub nonce: String,
+    pub algorithm: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,12 +27,10 @@ pub fn parse_www_authenticate(input: &str) -> Result<DigestChallenge> {
     }
     let params = parts.next().ok_or(SipError::Invalid("auth params"))?;
 
-    let mut realm: Option<SmallString<MAX_HEADER_VALUE>> = None;
-    let mut nonce: Option<SmallString<MAX_HEADER_VALUE>> = None;
-    let mut algorithm: SmallString<MAX_HEADER_VALUE> = SmallString::new();
-    algorithm
-        .push_str("MD5")
-        .map_err(|_| SipError::Capacity)?;
+    let mut realm: Option<String> = None;
+    let mut nonce: Option<String> = None;
+    let mut algorithm = String::new();
+    algorithm.push_str("MD5");
 
     for param in params.split(',') {
         let mut kv = param.trim().splitn(2, '=');
@@ -47,18 +45,18 @@ pub fn parse_www_authenticate(input: &str) -> Result<DigestChallenge> {
             .trim_matches('"');
         match key.to_ascii_lowercase().as_str() {
             "realm" => {
-                let mut v: SmallString<MAX_HEADER_VALUE> = SmallString::new();
-                v.push_str(raw_val).map_err(|_| SipError::Capacity)?;
+                let mut v = String::new();
+                v.push_str(raw_val);
                 realm = Some(v);
             }
             "nonce" => {
-                let mut v: SmallString<MAX_HEADER_VALUE> = SmallString::new();
-                v.push_str(raw_val).map_err(|_| SipError::Capacity)?;
+                let mut v = String::new();
+                v.push_str(raw_val);
                 nonce = Some(v);
             }
             "algorithm" => {
                 algorithm.clear();
-                algorithm.push_str(raw_val).map_err(|_| SipError::Capacity)?;
+                algorithm.push_str(raw_val);
             }
             _ => {}
         }
@@ -78,7 +76,7 @@ pub fn authorization_header(
     uri: &str,
 ) -> Result<Header> {
     let response = compute_digest_response(challenge, creds, method, uri)?;
-    let mut value: SmallString<MAX_HEADER_VALUE> = SmallString::new();
+    let mut value = String::new();
     write!(
         value,
         "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\", algorithm=\"{}\"",
@@ -94,27 +92,27 @@ pub fn compute_digest_response(
     creds: &DigestCredentials<'_>,
     method: &str,
     uri: &str,
-) -> Result<SmallString<MAX_HEADER_VALUE>> {
-    let mut a1: SmallString<MAX_HEADER_VALUE> = SmallString::new();
+) -> Result<String> {
+    let mut a1 = String::new();
     write!(a1, "{}:{}:{}", creds.username, challenge.realm, creds.password)
         .map_err(|_| SipError::Capacity)?;
-    let mut a2: SmallString<MAX_HEADER_VALUE> = SmallString::new();
+    let mut a2 = String::new();
     write!(a2, "{}:{}", method, uri)
         .map_err(|_| SipError::Capacity)?;
 
     let ha1 = md5_hex(a1.as_bytes());
     let ha2 = md5_hex(a2.as_bytes());
 
-    let mut combo: SmallString<MAX_HEADER_VALUE> = SmallString::new();
+    let mut combo = String::new();
     write!(combo, "{}:{}:{}", ha1, challenge.nonce, ha2)
         .map_err(|_| SipError::Capacity)?;
 
     Ok(md5_hex(combo.as_bytes()))
 }
 
-fn md5_hex(data: &[u8]) -> SmallString<MAX_HEADER_VALUE> {
+fn md5_hex(data: &[u8]) -> String {
     let digest = md5::Md5::digest(data);
-    let mut out: SmallString<MAX_HEADER_VALUE> = SmallString::new();
+    let mut out = String::new();
     for b in &digest {
         let _ = write!(out, "{:02x}", b);
     }
