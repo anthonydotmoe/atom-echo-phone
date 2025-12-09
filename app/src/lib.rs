@@ -21,9 +21,15 @@ pub enum AppError {
 pub fn run() -> Result<(), AppError> {
     info!("starting Atom Echo phone runtime");
 
-    let wifi_config = WifiConfig::new(settings::SETTINGS.wifi_ssid, settings::SETTINGS.wifi_password)
+    let wifi_config = WifiConfig::new(
+        settings::SETTINGS.wifi_ssid,
+        settings::SETTINGS.wifi_password,
+        settings::SETTINGS.wifi_username,
+    )
         .map_err(|err| AppError::Hardware(format!("{err:?}")))?;
-    let device = Device::init(wifi_config).map_err(|err| AppError::Hardware(format!("{err:?}")))?;
+
+    let device = Device::init(wifi_config)
+        .map_err(|err| AppError::Hardware(format!("{err:?}")))?;
 
     // Create channels
     let (sip_tx, sip_rx) = channel::<messages::SipCommand>();

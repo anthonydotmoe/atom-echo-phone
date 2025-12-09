@@ -1,17 +1,26 @@
-use std::net::UdpSocket;
+use std::io::ErrorKind::WouldBlock;
+use std::net::{SocketAddr, UdpSocket};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use heapless::String as HString;
-use log::{debug, warn};
 
 use sdp::SessionDescription;
 use sip_core::{
-    authorization_header, DigestCredentials, DialogState, RegistrationResult, RegistrationState,
-    SipStack,
+    authorization_header, CoreDialogEvent, CoreEvent, CoreRegistrationEvent,
+    DigestCredentials, RegistrationResult, RegistrationState, SipStack,
+
+    log_stack_high_water,
 };
 
-use crate::messages::{AudioCommand, AudioCommandSender, ButtonEvent, RtpRxCommand, RtpRxCommandSender, RtpTxCommand, RtpTxCommandSender, SipCommand, SipCommandReceiver};
+use crate::messages::{
+    AudioCommand, AudioCommandSender, ButtonEvent,
+    RtpRxCommand, RtpRxCommandSender,
+    RtpTxCommand, RtpTxCommandSender,
+    SipCommand, SipCommandReceiver
+};
+
+const STACK_SIZE: usize = 64 * 1024;
 
 pub fn spawn_sip_task(
     settings: &'static crate::settings::Settings,
@@ -21,39 +30,42 @@ pub fn spawn_sip_task(
     rtp_rx_tx: RtpRxCommandSender,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
-        .stack_size(64 * 1024)
+        .stack_size(STACK_SIZE)
+        .name("sip".into())
         .spawn(move || {
-            let mut task = SipTask::new(settings, sip_rx, audio_tx, rtp_tx_tx, rtp_rx_tx);
+            let mut task = Box::new(
+                SipTask::new(settings, sip_rx, audio_tx, rtp_tx_tx, rtp_rx_tx)
+            );
             task.run();
-    }).unwrap()
+    })
+    .expect("failed to spawn SIP task")
 }
 
 struct SipTask {
+    // App wiring
     settings: &'static crate::settings::Settings,
     sip_rx: SipCommandReceiver,
     audio_tx: AudioCommandSender,
     rtp_tx_tx: RtpTxCommandSender,
     rtp_rx_tx: RtpRxCommandSender,
 
-    sip: SipStack,
-    dialog_state: DialogState,
-    remote_rtp: Option<(HString<48>, u16)>,
+    // Core SIP logic
+    core: SipStack,
 
-    seq: u16,
-    timestamp: u32,
-
-    registrar: String,
-    target: String,
-
+    // Networking
+    rx_buf: [u8; 1500],
     sip_socket: UdpSocket,
     rtp_socket: UdpSocket,
+    registrar: String,
     local_ip: String,
     local_sip_port: u16,
     local_rtp_port: u16,
 
+    // Timers
     next_register: Instant,
+
+    // Local mirror of reg state so we can log transitions
     last_reg_state: RegistrationState,
-    pending_auth: Option<sip_core::DigestChallenge>,
 }
 
 impl SipTask {
@@ -64,37 +76,28 @@ impl SipTask {
         rtp_tx_tx: RtpTxCommandSender,
         rtp_rx_tx: RtpRxCommandSender,
     ) -> Self {
-        let sip = SipStack::default();
-        let dialog_state = DialogState::Idle;
+        let core = SipStack::default();
 
         let registrar = parse_uri(settings.sip_registrar);
-        let target = parse_uri(settings.sip_target);
 
+        // SIP socket
         let sip_socket = UdpSocket::bind("0.0.0.0:0").expect("create SIP socket");
-        match sip_socket.set_nonblocking(true) {
-            Ok(_) => log::info!("Set SIP socket to non-blocking"),
-            Err(e) => {
-                log::error!("Set SIP socket to non-blocking: {:?}", e);
+        sip_socket
+            .set_nonblocking(true)
+            .expect("set SIP socket non-blocking");
 
-                thread::sleep(Duration::from_secs(1));
-            }
-        }
-
-        if let Ok(addr) = registrar.parse::<std::net::SocketAddr>() {
+        if let Ok(addr) = registrar.parse::<SocketAddr>() {
             let _ = sip_socket.connect(addr);
         }
 
         let (local_ip, local_sip_port) = local_ip_port(&sip_socket);
 
+        // RTP socket
         let rtp_socket = UdpSocket::bind("0.0.0.0:0").expect("create RTP socket");
         let local_rtp_port = rtp_socket
             .local_addr()
             .map(|addr| addr.port())
             .unwrap_or(10_000);
-
-        let next_register = Instant::now();
-        let last_reg_state = RegistrationState::Unregistered;
-        let pending_auth = None;
 
         Self {
             settings,
@@ -103,36 +106,37 @@ impl SipTask {
             rtp_tx_tx,
             rtp_rx_tx,
 
-            sip,
-            dialog_state,
-            remote_rtp: None,
+            core,
 
-            seq: 1,
-            timestamp: 0,
-
-            registrar,
-            target,
-
+            rx_buf: [0u8; 1500],
             sip_socket,
             rtp_socket,
+            registrar,
             local_ip,
             local_sip_port,
             local_rtp_port,
 
-            next_register,
-            last_reg_state,
-            pending_auth,
+            next_register: Instant::now(),
+            last_reg_state: RegistrationState::Unregistered,
         }
     }
 
     fn run(&mut self) {
+        log::info!("SIP task started: local SIP {}:{}, RTP {}",
+            self.local_ip, self.local_sip_port, self.local_rtp_port
+        );
+
+        log_stack_high_water("run");
+
         loop {
             let now = Instant::now();
 
             self.maybe_send_register(now);
             self.poll_sip_socket();
+
+
             if !self.poll_commands() {
-                // Channel closed - exit task.
+                log::info!("SIP task exiting: command channel closed");
                 break;
             }
 
@@ -140,29 +144,43 @@ impl SipTask {
         }
     }
 
+    // --- Registration --------------------------------------------------------
+
     fn maybe_send_register(&mut self, now: Instant) {
-        let reg_state = self.sip.registration.state();
+        let reg_state = self.core.registration.state();
 
         // Only send REGISTER when the timer fires and we're not already in-flight
         if now < self.next_register || reg_state == RegistrationState::Registering {
             return;
         }
 
+        log::info!("Attempting SIP registration");
+
+        // If already registered, keep the same Expires
+        // otherwise use a small initial value.
         let expires = if reg_state == RegistrationState::Registered {
-            self.sip.registration.last_expires()
+            self.core.registration.last_expires()
         } else {
-            3600
+            30
         };
 
         let auth_header = self
-            .pending_auth
-            .take()
+            .core
+            .last_challenge()
             .and_then(|challenge| self.build_auth_header(&challenge, "REGISTER"));
         
         let contact_uri =
-            build_contact_uri(self.settings.sip_contact, &self.local_ip, self.local_sip_port);
+            build_contact_uri(
+                self.settings.sip_contact,
+                &self.local_ip,
+                self.local_sip_port,
+            );
+
+        log::info!("contact uri: \"{}\"", contact_uri);
+
+        log_stack_high_water("after build_contact_uri");
         
-        match self.sip.register(
+        let req = match self.core.build_register(
             self.settings.sip_registrar,
             &contact_uri,
             &self.local_ip,
@@ -170,19 +188,34 @@ impl SipTask {
             expires,
             auth_header,
         ) {
-            Ok(req) => {
-                if let Ok(rendered) = req.render() {
-                    debug!("sending REGISTER:\n{}", rendered);
-                    send_sip(&self.sip_socket, &self.registrar, &rendered);
-                    self.next_register = now + Duration::from_secs(5);
-                }
-
-            }
-            Err(err) => {
-                warn!("failed to build REGISTER: {:?}", err);
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("failed to build REGISTER: {:?}", e);
                 self.next_register = now + Duration::from_secs(30);
+                return;
             }
-        }
+        };
+
+        log_stack_high_water("after build_register");
+
+        let rendered = match req.render::<512>() {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("failed to render REGISTER: {:?}", e);
+                self.next_register = now + Duration::from_secs(30);
+                return;
+            }
+        };
+
+        log_stack_high_water("after render");
+
+        log::info!("sending REGISTER" /*\n{}", rendered*/ );
+        send_sip(&self.sip_socket, &self.registrar, &rendered);
+
+        log_stack_high_water("after send_sip");
+
+        // Give a short window for the first response
+        self.next_register = now + Duration::from_secs(5);
     }
 
     fn build_auth_header(
@@ -194,115 +227,168 @@ impl SipTask {
             username: self.settings.sip_username,
             password: self.settings.sip_password,
         };
-        authorization_header(challenge, &creds, method, self.settings.sip_registrar).ok()
+        authorization_header(
+            challenge,
+            &creds,
+            method,
+            self.settings.sip_registrar
+        ).ok()
     }
 
-    fn poll_sip_socket(&mut self) {
-        let mut buf = [0u8; 1500];
-
-        loop {
-            match self.sip_socket.recv_from(&mut buf) {
-                Ok((len, addr)) => {
-                    let text = match core::str::from_utf8(&buf[..len]) {
-                        Ok(t) => t,
-                        Err(_) => {
-                            warn!("received non-UTF8 SIP from {addr}");
-                            continue;
-                        }
-                    };
-
-                    match sip_core::parse_message(text) {
-                        Ok(msg) => self.handle_sip_message(msg),
-                        Err(_) => warn!("failed to parse SIP from {addr}"),
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Nothing pending.
-                    break;
-                }
-                Err(e) => {
-                    warn!("SIP recv error: {:?}", e);
-                    break;
-                }
-            }
-        }
-    }
-
-    fn handle_sip_message(&mut self, msg: sip_core::Message) {
-        match msg {
-            sip_core::Message::Response(resp) => {
-                if resp.status_code == 200 && !resp.body.is_empty() {
-                    if let Ok(sdp) = sdp::parse(&resp.body) {
-
-                        // If it's an SDP packet, let the RTP threads know
-
-                        let mut ip = HString::<48>::new();
-                        let _ = ip.push_str(&sdp.connection_address);
-                        let port = sdp.media.port;
-
-                        let _ = self.rtp_tx_tx.send(RtpTxCommand::StartStream {
-                            remote_ip: ip,
-                            remote_port: port,
-                            ssrc: 0,            //TODO: FixMe
-                            payload_type: 0,    //TODO: FixMe
-                        });
-
-                        let _ = self.rtp_rx_tx.send(RtpRxCommand::StartStream {
-                            expected_ssrc: 0, // TODO: FixMe
-                            payload_type: 0,  // TODO: FixMe
-                        });
-
-                        //return Some((ip, port));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_register_response(&mut self, resp: &sip_core::Response) {
-        match self.sip.on_register_response(resp) {
-            RegistrationResult::Registered(expires) => {
-                let next = (expires as u64 * 8) / 10;
-                let delay = Duration::from_secs(next.max(5));
-                self.next_register = Instant::now() + delay;
+    fn handle_registration_result(&mut self, result: RegistrationResult) {
+        match result {
+            RegistrationResult::Registered(_) => {
+                let refresh_secs = self.core.registration_refresh_interval_secs();
+                let refresh_secs = refresh_secs.max(5);
+                log::info!(
+                    "registration succeeded; scheduling refresh in {}s",
+                    refresh_secs
+                );
+                self.next_register = Instant::now() + Duration::from_secs(refresh_secs);
             }
             RegistrationResult::AuthRequired => {
-                self.pending_auth = self.sip.registration.last_challenge();
+                log::info!("registration: auth required; retrying soon");
                 self.next_register = Instant::now() + Duration::from_secs(1);
             }
             RegistrationResult::Failed(code) => {
-                warn!("registration failed with {}", code);
+                log::warn!("registration failed with status {}", code);
                 self.next_register = Instant::now() + Duration::from_secs(30);
             }
             RegistrationResult::Sent => {
-                // nothing special to schedule; we're already waiting
+                // We don't actually return Sent from this core right now,
+                // but we keep it for completeness.
             }
         }
 
-        let state = self.sip.registration.state();
+        let state = self.core.registration_state();
         if state != self.last_reg_state {
             self.last_reg_state = state;
-            debug!("registration state -> {:?}", state);
+            log::info!("registration state -> {:?}", state);
         }
     }
 
-    fn set_dialog_state(&mut self, state: DialogState) {
-        self.dialog_state = state;
-        let _ = self
-            .audio_tx
-            .send(AudioCommand::SetDialogState(self.dialog_state));
+    // --- Network receive -----------------------------------------------------
 
+    fn poll_sip_socket(&mut self) {
+        loop {
+            match self.sip_socket.recv_from(&mut self.rx_buf) {
+                Ok((len, addr)) => {
+                    if let Ok(text) = core::str::from_utf8(&self.rx_buf[..len]) {
+                        if let Ok(msg) = sip_core::parse_message(text) {
+                            let events = self.core.on_message(msg);
+                            for ev in events {
+                                self.handle_core_event(ev, addr);
+                            }
+                        }
+
+                    }
+                }
+                Err(ref e) if e.kind() == WouldBlock => break,
+                Err(e) => {
+                    log::warn!("SIP recv error: {:?}", e);
+                    break;
+                }
+            }
+        }
     }
 
-    /// Returns false if the command channel is closed and we should exit
+    fn handle_core_event(&mut self, ev: CoreEvent, remote_addr: SocketAddr) {
+        match ev {
+            CoreEvent::Registration(reg_ev) => self.handle_reg_event(reg_ev),
+            CoreEvent::Dialog(dialog_ev) => {
+                self.handle_dialog_event(dialog_ev, remote_addr)
+            }
+        }
+    }
+
+    fn handle_reg_event(&mut self, ev: CoreRegistrationEvent) {
+        match ev {
+            CoreRegistrationEvent::StateChanged(_state) => {
+                // We already update/notify in handle_registration_result.
+                // This hook is for additional behavior if needed.
+            }
+        }
+    }
+
+    fn handle_dialog_event(
+        &mut self,
+        ev: CoreDialogEvent,
+        remote_addr: SocketAddr,
+    ) {
+        match ev {
+            CoreDialogEvent::IncomingInvite { request, .. } => {
+                log::info!("Incoming INVITE from {}", remote_addr);
+                self.on_incoming_invite(request);
+            }
+            CoreDialogEvent::DialogStateChanged(state) => {
+                log::info!("Dialog state -> {:?}", state);
+                let _ = self
+                    .audio_tx
+                    .send(AudioCommand::SetDialogState(state));
+            }
+        }
+    }
+
+    fn on_incoming_invite(&mut self, req: sip_core::Request) {
+        // Very simple SDP offer handling:
+        // - Parse remote SDP from INVITE body.
+        // - Start RTP TX/RX toward the address/port in the SDP.
+        //
+        // TODO: Answer (200 OK)
+
+        if req.body.is_empty() {
+            log::warn!("INVITE had no SDP body; ignoring for now");
+            return;
+        }
+
+        let sdp_text = req.body.as_str();
+        let sdp = match sdp::parse(sdp_text) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("failed to parse SDP: {:?}", e);
+                return;
+            }
+        };
+
+        // Decide where to send RTP
+        let remote_ip = sdp.connection_address.clone();
+        let remote_port = sdp.media.port;
+
+        log::info!(
+            "SDP offer: remote RTP {}:{} (local RTP port {})",
+            remote_ip, remote_port, self.local_rtp_port
+        );
+
+        // Kick RTP threads
+        let mut ip = HString::<48>::new();
+        let _ = ip.push_str(&remote_ip);
+
+        let _ = self.rtp_tx_tx.send(RtpTxCommand::StartStream {
+            remote_ip: ip,
+            remote_port,
+            ssrc: 0,         //TODO: configure
+            payload_type: 0, // TODO: map from SDP
+        });
+
+        let _ = self.rtp_rx_tx.send(RtpRxCommand::StartStream {
+            expected_ssrc: 0, // TODO: configure
+            payload_type: 0,  // TODO: map from SDP
+        });
+
+        //TODO: Extend this by
+        // - Building 180 Ringing and 200 OK via core.dialog.build_response_for_request(...)
+        // - Rendering and sending them via send_sip().
+    }
+
+    // --- Commands from UI / other tasks --------------------------------------
+
     fn poll_commands(&mut self) -> bool {
         loop {
             match self.sip_rx.try_recv() {
                 Ok(cmd) => self.handle_command(cmd),
                 Err(std::sync::mpsc::TryRecvError::Empty) => return true,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    warn!("SIP command channel closed");
+                    log::warn!("SIP command channel closed");
                     return false;
                 }
             }
@@ -317,15 +403,16 @@ impl SipTask {
         }
     }
 
-    fn handle_button_event(&mut self, event: ButtonEvent) {
-        if !matches!(
-            self.dialog_state,
-            DialogState::Idle | DialogState::Terminated
-        ) {
-            return;
-        }
+    fn handle_button_event(&mut self, _event: ButtonEvent) {
+        // TODO: wire in call control (answer, hangup, etc.)
+        // Using:
+        // - self.core.dialog.start_outgoing(...)
+        // - self.core.dialog.build_bye(...)
+        // - plus RTP commands and UI updates.
     }
 }
+
+// --- Small helpers -----------------------------------------------------------
 
 fn send_sip(socket: &UdpSocket, target: &str, payload: &str) {
     if let Ok(addr) = target.parse::<std::net::SocketAddr>() {

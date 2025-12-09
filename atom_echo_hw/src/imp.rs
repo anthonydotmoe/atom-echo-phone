@@ -2,20 +2,24 @@ use super::{ButtonState, HardwareError, LedState, WifiConfig};
 
 #[cfg(target_os = "espidf")]
 mod esp {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+
+    use esp_idf_svc::hal as esp_idf_hal;
+    use esp_idf_svc::sys::{esp_eap_client_set_password, esp_eap_client_set_username, esp_wifi_sta_enterprise_enable};
+    use esp_idf_svc::sys as esp_idf_sys;
 
     use super::*;
     use esp_idf_hal::gpio::AnyIOPin;
     use esp_idf_hal::gpio::{Gpio39, Input, PinDriver};
     use esp_idf_hal::i2s::{config::StdConfig, I2sBiDir, I2sDriver};
     use esp_idf_hal::peripherals::Peripherals;
-    use esp_idf_hal::rmt::{config::TransmitConfig, FixedLengthSignal, PinState, Pulse, TxRmtDriver};
+    use esp_idf_hal::rmt::{config::TransmitConfig, FixedLengthSignal, PinState, Pulse};
     use esp_idf_svc::eventloop::EspSystemEventLoop;
     use esp_idf_svc::wifi::{AuthMethod, ClientConfiguration, Configuration, EspWifi};
     use esp_idf_svc::nvs::EspDefaultNvsPartition;
+    use esp_idf_sys::esp_eap_client_set_identity;
     use esp_idf_sys::EspError;
     use heapless::String;
-    use log::info;
 
     /// Concrete device handle on ESP-IDF.
     ///
@@ -44,42 +48,46 @@ mod esp {
         )
             .map_err(map_wifi_err)?;
 
-        info!("Connecting to \"{}\", pass: {}", &config.ssid, &config.password);
+        // If there's a username, use WPAn-Enterprise
+        if let Some(username) = config.username {
+            init_wifi_enterprise(&mut wifi, &config.ssid, &username, &config.password)?;
+        } else {
+            init_wifi_personal(&mut wifi, &config.ssid, &config.password)?;
+        }
 
-        // Convert heapless::String to the types EspWifi expects.
-        let mut ssid = String::<32>::new();
-        ssid.push_str(&config.ssid)
-            .map_err(|_| HardwareError::Config("SSID too long"))?;
-
-        let mut password = String::<64>::new();
-        password
-            .push_str(&config.password)
-            .map_err(|_| HardwareError::Config("password too long"))?;
-
-        let enterprise_conf = ClientConfiguration {
-            auth_method: AuthMethod::WPA2Enterprise,
-            ssid,
-            ..Default::default()
-        };
-
-        wifi.set_configuration(&Configuration::Client(enterprise_conf))
-            .map_err(map_wifi_err)?;
-
-        wifi.
         wifi.start().map_err(map_wifi_err)?;
         wifi.connect().map_err(map_wifi_err)?;
 
+
         loop {
             let ret = wifi.is_connected().unwrap();
-            if (ret) {
+            if ret {
                 break;
             }
 
-            info!("WiFi connecting...");
-            std::thread::sleep(Duration::from_secs(1))
+            log::info!("WiFi connecting...");
+            std::thread::sleep(Duration::from_secs(1));
         }
+        
+        let ip = loop {
+            // Wait for address
+            let netif = wifi.sta_netif();
+            match netif.get_ip_info() {
+                Ok(info) => {
+                    if !info.ip.is_unspecified() {
+                        break info.ip
+                    }
+                }
+                Err(e) => {
+                    log::error!("get_ip_info: {}", e);
+                }
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        };
 
-        info!("Wi-Fi connected");
+
+        log::info!("Wi-Fi connected");
+        log::info!("IP: {}", ip);
 
         /*
         // --- I2S audio ---
@@ -104,7 +112,7 @@ mod esp {
         )
         .map_err(map_audio_err)?;
 
-        info!("I2S configured for bidirectional audio");
+        log::info!("I2S configured for bidirectional audio");
 
         // Button input (pull-up, active-low)
         let button_pin = pins.gpio39;
@@ -207,6 +215,103 @@ mod esp {
     fn map_gpio_err(err: EspError) -> HardwareError {
         log::error!("GPIO error: {:?}", err);
         HardwareError::Gpio("gpio error")
+    }
+
+    fn init_wifi_personal(
+        wifi: &mut EspWifi,
+        ssid: &str,
+        pass: &str,
+    ) -> Result<(), HardwareError> {
+        let mut h_ssid = String::<32>::new();
+        h_ssid.push_str(ssid)
+            .map_err(|_| HardwareError::Config("SSID too long"))?;
+
+        let mut password = String::<64>::new();
+        password.push_str(pass)
+            .map_err(|_| HardwareError::Config("Password too long"))?;
+
+        let config = ClientConfiguration {
+            ssid: h_ssid,
+            password,
+            ..Default::default()
+        };
+
+        wifi.set_configuration(&Configuration::Client(config))
+            .map_err(map_wifi_err)
+    }
+
+    fn init_wifi_enterprise(
+        wifi: &mut EspWifi,
+        ssid: &str,
+        user: &str,
+        pass: &str,
+    ) -> Result<(), HardwareError> {
+        log::debug!("Connecting to \"{}\"", &ssid);
+        log::debug!("  user: {}", &user);
+        log::debug!("  pass: {}", &pass);
+
+        let mut h_ssid = String::<32>::new();
+        h_ssid.push_str(ssid)
+            .map_err(|_| HardwareError::Config("SSID too long"))?;
+
+        // Configure with svc::wifi::set_configuration, then override
+        let config = ClientConfiguration {
+            ssid: h_ssid,
+            ..Default::default()
+        };
+
+        wifi.set_configuration(&Configuration::Client(config))
+            .map_err(map_wifi_err)?;
+
+        // Begin override
+        set_enterprise_username(user).map_err(map_wifi_err)?;
+        set_enterprise_password(pass).map_err(map_wifi_err)?;
+
+        let err = unsafe { esp_wifi_sta_enterprise_enable() };
+        EspError::convert(err).map_err(map_wifi_err)
+    }
+
+    /// Configure the WPA2-Enterprise username (PEAP/TTLS)
+    /// 
+    /// Requirements from ESP-IDF:
+    /// - length must be between 1 and 127 bytes (inclusive)
+    fn set_enterprise_username(username: &str) -> Result<(), EspError> {
+        let bytes = username.as_bytes();
+        let len = bytes.len();
+
+        // Enforce the documented limits: 1..=127 bytes
+        if len == 0 || len >= 128 {
+            return Err(EspError::from_infallible::<{ esp_idf_sys::ESP_ERR_INVALID_ARG }>());
+        }
+
+        let ptr = bytes.as_ptr() as *const _;
+        let len_c = len as _;
+
+        let err = unsafe { esp_eap_client_set_identity(ptr, len_c) };
+        EspError::convert(err)?;
+
+        let err = unsafe { esp_eap_client_set_username(ptr, len_c) };
+        EspError::convert(err)
+    }
+
+    /// Configure the WPA2-Enterprise password (PEAP/TTLS)
+    /// 
+    /// Requirements from ESP-IDF:
+    /// - length must be non-zero
+    fn set_enterprise_password(password: &str) -> Result<(), EspError> {
+        let bytes = password.as_bytes();
+        let len = bytes.len();
+
+        // Enforce the documented limits
+        if len == 0 {
+            return Err(EspError::from_infallible::<{ esp_idf_sys::ESP_ERR_INVALID_ARG }>());
+        }
+
+        let ptr = bytes.as_ptr() as *const _;
+        let len_c = len as _;
+
+        let err = unsafe { esp_eap_client_set_password(ptr, len_c) };
+        EspError::convert(err)
     }
 }
 

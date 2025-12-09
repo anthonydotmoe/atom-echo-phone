@@ -14,10 +14,11 @@ pub type SmallString<const N: usize> = String<N>;
 pub struct WifiConfig {
     pub ssid: SmallString<32>,
     pub password: SmallString<64>,
+    pub username: Option<SmallString<32>>,
 }
 
 impl WifiConfig {
-    pub fn new(ssid: &str, password: &str) -> Result<Self, HardwareError> {
+    pub fn new(ssid: &str, password: &str, username: Option<&str>) -> Result<Self, HardwareError> {
         let mut ssid_buf = SmallString::<32>::new();
         ssid_buf
             .push_str(ssid)
@@ -28,9 +29,21 @@ impl WifiConfig {
             .push_str(password)
             .map_err(|_| HardwareError::Config("password too long"))?;
 
+        let user_buf = if let Some(user) = username {
+            let mut username_buf = SmallString::<32>::new();
+            username_buf
+                .push_str(user)
+                .map_err(|_| HardwareError::Config("username too long"))?;
+
+            Some(username_buf)
+        } else {
+            None
+        };
+
         Ok(Self {
             ssid: ssid_buf,
             password: pwd_buf,
+            username: user_buf,
         })
     }
 }

@@ -10,6 +10,4 @@ thiserror.workspace = true
 heapless.workspace = true
 
 [target.'cfg(target_os = "espidf")'.dependencies]
-esp-idf-svc = "0.51"
-esp-idf-hal = { version = "0.45", features = ["rmt-legacy"] }
-esp-idf-sys = "0.36"
+esp-idf-svc = { version = "0.51", features = ["experimental"] }
