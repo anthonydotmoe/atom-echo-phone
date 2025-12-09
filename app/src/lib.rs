@@ -28,17 +28,17 @@ pub fn run() -> Result<(), AppError> {
     )
         .map_err(|err| AppError::Hardware(format!("{err:?}")))?;
 
-    let device = Device::init(wifi_config)
+    let _device = Device::init(wifi_config)
         .map_err(|err| AppError::Hardware(format!("{err:?}")))?;
 
     // Create channels
-    let (sip_tx, sip_rx) = channel::<messages::SipCommand>();
-    let (audio_tx, audio_rx) = channel::<messages::AudioCommand>();
-    let (rtp_tx_tx, rtp_tx_rx) = channel::<messages::RtpTxCommand>();
-    let (rtp_rx_tx, rtp_rx_rx) = channel::<messages::RtpRxCommand>();
-    let (ui_tx, ui_rx) = channel::<messages::UiCommand>();
-    let (media_in_tx, media_in_rx) = channel::<messages::MediaIn>();
-    let (media_out_tx, media_out_rx) = channel::<messages::MediaOut>();
+    let (_sip_tx, sip_rx) = channel::<messages::SipCommand>();
+    let (audio_tx, _audio_rx) = channel::<messages::AudioCommand>();
+    let (rtp_tx_tx, _rtp_tx_rx) = channel::<messages::RtpTxCommand>();
+    let (rtp_rx_tx, _rtp_rx_rx) = channel::<messages::RtpRxCommand>();
+    let (_ui_tx, _ui_rx) = channel::<messages::UiCommand>();
+    let (_media_in_tx, _media_in_rx) = channel::<messages::MediaIn>();
+    let (_media_out_tx, _media_out_rx) = channel::<messages::MediaOut>();
 
     /*
     TODO: Just mapping out who needs what
