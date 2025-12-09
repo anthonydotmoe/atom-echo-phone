@@ -126,3 +126,11 @@ impl Device {
 
 // Platform-specific implementation lives in `imp`:
 mod imp;
+
+/// Return a random 32-bit value.
+/// 
+/// On ESP-IDF this uses `esp_random`, on hosts it falls back to the `rand`
+/// crate.
+pub fn random_u32() -> u32 {
+    imp::random_u32()
+}

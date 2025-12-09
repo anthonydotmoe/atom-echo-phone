@@ -9,5 +9,8 @@ log.workspace = true
 thiserror.workspace = true
 heapless.workspace = true
 
+[target.'cfg(not(target_os = "espidf"))'.dependencies]
+rand = "0.9"
+
 [target.'cfg(target_os = "espidf")'.dependencies]
 esp-idf-svc = { version = "0.51", features = ["experimental"] }

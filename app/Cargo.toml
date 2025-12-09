@@ -18,6 +18,9 @@ sip_core = { path = "../sip_core" }
 heapless.workspace = true
 static-toml = "1"
 
+[target.'cfg(not(target_os = "espidf"))'.dependencies]
+env_logger = "0.11"
+
 [target.'cfg(target_os = "espidf")'.dependencies]
 esp-idf-svc = "0.51"
 

@@ -5,8 +5,11 @@ mod esp {
     use std::time::Duration;
 
     use esp_idf_svc::hal as esp_idf_hal;
-    use esp_idf_svc::sys::{esp_eap_client_set_password, esp_eap_client_set_username, esp_wifi_sta_enterprise_enable};
     use esp_idf_svc::sys as esp_idf_sys;
+    use esp_idf_sys::{
+        esp_eap_client_set_password, esp_eap_client_set_username,
+        esp_random, esp_wifi_sta_enterprise_enable,
+    };
 
     use super::*;
     use esp_idf_hal::gpio::AnyIOPin;
@@ -313,6 +316,10 @@ mod esp {
         let err = unsafe { esp_eap_client_set_password(ptr, len_c) };
         EspError::convert(err)
     }
+
+    pub fn random_u32() -> u32 {
+        unsafe { esp_random() }
+    }
 }
 
 #[cfg(not(target_os = "espidf"))]
@@ -353,12 +360,16 @@ mod host {
             Ok(())
         }
     }
+
+    pub fn random_u32() -> u32 {
+        rand::random::<u32>()
+    }
 }
 
 #[cfg(target_os = "espidf")]
-pub use esp::DeviceInner;
+pub use esp::{DeviceInner, random_u32};
 #[cfg(not(target_os = "espidf"))]
-pub use host::DeviceInner;
+pub use host::{DeviceInner, random_u32};
 
 #[cfg(target_os = "espidf")]
 pub use esp::init_device;

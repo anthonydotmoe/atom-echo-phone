@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 use heapless::String as HString;
 
-use sdp::SessionDescription;
+use atom_echo_hw::random_u32;
+
 use sip_core::{
     authorization_header, CoreDialogEvent, CoreEvent, CoreRegistrationEvent,
     DigestCredentials, RegistrationResult, RegistrationState, SipStack,
@@ -17,8 +18,6 @@ use crate::messages::{
     RtpTxCommand, RtpTxCommandSender,
     SipCommand, SipCommandReceiver
 };
-
-const STACK_SIZE: usize = 8 * 1024;
 
 pub fn spawn_sip_task(
     settings: &'static crate::settings::Settings,
@@ -151,7 +150,7 @@ impl SipTask {
         }
 
         log::info!("Attempting SIP registration");
-        log_stack_high_water();
+        //log_stack_high_water();
 
         // If already registered, keep the same Expires
         // otherwise use a small initial value.
@@ -354,7 +353,7 @@ impl SipTask {
         let _ = self.rtp_tx_tx.send(RtpTxCommand::StartStream {
             remote_ip: ip,
             remote_port,
-            ssrc: get_new_ssrc(),
+            ssrc: random_u32(),
             payload_type: sdp.media.payload_type,
         });
 
@@ -440,12 +439,8 @@ fn local_ip_port(sock: &UdpSocket) -> (String, u16) {
     (addr.ip().to_string(), addr.port())
 }
 
-fn get_new_ssrc() -> u32 {
-    use esp_idf_svc::sys::esp_random;
-    unsafe { esp_random() }
-}
-
 // --- Stack size logging facility ---------------------------------------------
+/*
 extern "C" {
     fn uxTaskGetStackHighWaterMark(handle: *mut core::ffi::c_void) -> u32;
 }
@@ -458,3 +453,4 @@ pub fn log_stack_high_water() {
         log::info!("min remaining stack: {} bytes", bytes_left);
     }
 }
+*/
