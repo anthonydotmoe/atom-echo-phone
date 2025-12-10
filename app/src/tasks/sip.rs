@@ -3,17 +3,18 @@ use std::net::{SocketAddr, UdpSocket};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use sdp::{MediaDescription, SessionDescription};
 use sip_core::{
     authorization_header, CoreDialogEvent, CoreEvent, CoreRegistrationEvent,
-    DigestCredentials, RegistrationResult, RegistrationState, SipStack,
+    DigestCredentials, InviteKind, RegistrationResult, RegistrationState,
+    SipStack,
 };
 
 use crate::messages::{
-    self, AudioCommand, AudioCommandSender, ButtonEvent,
-    RtpRxCommand, RtpRxCommandSender,
-    RtpTxCommand, RtpTxCommandSender,
-    SipCommand, SipCommandReceiver,
-    UiCommand, UiCommandSender
+    self,
+    AudioCommand, AudioCommandSender, ButtonEvent, PhoneState,
+    RtpRxCommand, RtpRxCommandSender, RtpTxCommand, RtpTxCommandSender,
+    SipCommand, SipCommandReceiver, UiCommand, UiCommandSender
 };
 
 pub fn spawn_sip_task(
@@ -39,7 +40,8 @@ pub fn spawn_sip_task(
 #[derive(Debug)]
 struct CallContext {
     invite: sip_core::Request,
-    remote_sdp: sdp::SessionDescription,
+    remote_sdp: SessionDescription,
+    local_sdp: SessionDescription,
     ring_deadline: Option<Instant>, // Some(...) while ringing, None otherwise
 }
 
@@ -279,9 +281,10 @@ impl SipTask {
             match self.sip_socket.recv_from(&mut self.rx_buf) {
                 Ok((len, addr)) => {
                     if let Ok(text) = core::str::from_utf8(&self.rx_buf[..len]) {
-                        log::debug!("parse_message:\r\n{}", text);
+                        //log::debug!("parse_message:\r\n{}", text); switching to logging `Message`
                         match sip_core::parse_message(text) {
                             Ok(msg) => {
+                                log::debug!("parse_message ->\r\n{:?}", &msg);
                                 let events = self.core.on_message(msg);
                                 for ev in events {
                                     self.handle_core_event(ev, addr);
@@ -340,18 +343,23 @@ impl SipTask {
         remote_addr: SocketAddr,
     ) {
         match ev {
-            CoreDialogEvent::IncomingInvite { request, .. } => {
+            CoreDialogEvent::IncomingInvite { request, kind: InviteKind::Initial } => {
                 log::info!("Incoming INVITE from {}", remote_addr);
-                self.on_incoming_invite(request);
+                self.on_incoming_initial_invite(request);
+            }
+            CoreDialogEvent::IncomingInvite { request, kind: InviteKind::Reinvite } => {
+                log::info!("Incoming re-INVITE from {}", remote_addr);
+                self.on_incoming_reinvite(request);
             }
             CoreDialogEvent::DialogStateChanged(state) => {
                 log::info!("Dialog state -> {}", state);
                 self.broadcast_phone_state();
+                // TODO: maybe RTC/rtp_tx/rtp_rx updates based on Established/Terminated
             }
         }
     }
 
-    fn on_incoming_invite(&mut self, req: sip_core::Request) {
+    fn on_incoming_initial_invite(&mut self, req: sip_core::Request) {
         if req.body.is_empty() {
             log::warn!("INVITE had no SDP body; ignoring");
             return;
@@ -387,8 +395,43 @@ impl SipTask {
         self.call_ctx = Some(CallContext {
             invite: req,
             remote_sdp: sdp,
+            local_sdp: self.build_local_sdp(),
             ring_deadline: Some(ring_deadline),
         });
+
+        // UI and audio
+        let _ = self.ui_tx.send(UiCommand::DialogStateChanged(PhoneState::Ringing));
+        let _ = self.audio_tx.send(AudioCommand::SetDialogState(PhoneState::Ringing));
+    }
+
+    fn on_incoming_reinvite(&mut self, req: sip_core::Request) {
+        // Update remote SDP if provided
+        if !req.body.is_empty() {
+            match sdp::parse(req.body.as_str()) {
+                Ok(sdp) => {
+                    if let Some(ctx) = &mut self.call_ctx {
+                        ctx.remote_sdp = sdp;
+                    }
+                }
+                Err(e) => {
+                    log::warn!("failed to parse SDP on re-INVITE: {:?}", e);
+                    // TODO: send 488
+                }
+            }
+        }
+
+        // For now, just acknowledge with our current local SDP
+        if let Some(ctx) = &self.call_ctx {
+            let local_sdp = ctx.local_sdp.clone();
+            if let Err(e) = self.send_response_200_ok_with_sdp(&req, &local_sdp) {
+                log::warn!("failed to respond to re-INVITE: {:?}", e);
+            }
+        } else {
+            log::warn!("re-INVITE received but no call context; sending 481");
+            if let Err(e) = self.send_response_481_call_does_not_exist(&req) {
+                log::warn!("failed to send 481: {:?}", e);
+            }
+        }
     }
 
     // --- Network responses ---------------------------------------------------
@@ -408,15 +451,13 @@ impl SipTask {
     fn send_response_200_ok_with_sdp(
         &mut self,
         invite: &sip_core::Request,
-        local_sdp: &sdp::SessionDescription,
+        local_sdp: &SessionDescription,
     ) -> Result<(), sip_core::SipError> {
         let body = local_sdp.render().unwrap_or_default();
         let mut resp = self
             .core
             .dialog
-            .build_response_for_request(invite, 200, "OK", Some(&body))?;
-
-        resp.add_header(sip_core::Header::new("Content-Type", "application/sdp")?);
+            .build_response_for_request(invite, 200, "OK", Some(("application/sdp", &body)))?;
 
         let contact_uri = build_contact_uri(
             self.settings.sip_contact,
@@ -432,17 +473,32 @@ impl SipTask {
         Ok(())
     }
 
-    fn send_response_488_not_acceptable_here(
+    fn send_response_480_temporarily_unavailable(
         &mut self,
         invite: &sip_core::Request,
     ) -> Result<(), sip_core::SipError> {
         let resp = self
             .core
             .dialog
-            .build_response_for_request(invite, 488, "Not Acceptable Here", None)?;
+            .build_response_for_request(invite, 480, "Temporarily Unavailable", None)?;
 
         let text = resp.render()?;
-        log::debug!("Sending 488 Not Acceptable Here:\r\n{}", text);
+        log::debug!("Sending 480 Temporarily Unavailable:\r\n{}", text);
+        send_sip(&self.sip_socket, &self.registrar, &text);
+        Ok(())
+    }
+
+    fn send_response_481_call_does_not_exist(
+        &mut self,
+        invite: &sip_core::Request,
+    ) -> Result<(), sip_core::SipError> {
+        let resp = self
+            .core
+            .dialog
+            .build_response_for_request(invite, 481, "Call/Transaction Does Not Exist", None)?;
+
+        let text = resp.render()?;
+        log::debug!("Sending 481 Call/Transaction Does Not Exist:\r\n{}", text);
         send_sip(&self.sip_socket, &self.registrar, &text);
         Ok(())
     }
@@ -462,17 +518,17 @@ impl SipTask {
         Ok(())
     }
 
-    fn send_response_480_temporarily_unavailable(
+    fn send_response_488_not_acceptable_here(
         &mut self,
         invite: &sip_core::Request,
     ) -> Result<(), sip_core::SipError> {
         let resp = self
             .core
             .dialog
-            .build_response_for_request(invite, 480, "Temporarily Unavailable", None)?;
+            .build_response_for_request(invite, 488, "Not Acceptable Here", None)?;
 
         let text = resp.render()?;
-        log::debug!("Sending 480 Temporarily Unavailable:\r\n{}", text);
+        log::debug!("Sending 488 Not Acceptable Here:\r\n{}", text);
         send_sip(&self.sip_socket, &self.registrar, &text);
         Ok(())
     }
@@ -549,11 +605,11 @@ impl SipTask {
         }
     }
 
-    fn build_local_sdp(&self) -> sdp::SessionDescription {
-        sdp::SessionDescription {
+    fn build_local_sdp(&self) -> SessionDescription {
+        SessionDescription {
             origin: "-".to_string(),
             connection_address: self.local_ip.clone(),
-            media: sdp::MediaDescription {
+            media: MediaDescription {
                 port: self.local_rtp_port,
                 payload_type: 0, // PCMU/8000
                 codec: sdp::Codec::Pcmu,

@@ -3,9 +3,7 @@ use core::mem;
 use std::fmt::Display;
 
 use crate::{
-    header_value,
-    message::{Header, Method, Request, Response},
-    Result, SipError,
+    CoreDialogEvent, CoreEvent, Result, SipError, header_value, message::{Header, Method, Request, Response}, stack::InviteKind
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,7 +149,7 @@ impl Dialog {
         req: &Request,
         status: u16,
         reason: &str,
-        body: Option<&str>,
+        body: Option<(&str, &str)>, //TODO: (Content-Type, <data>) struct?
     ) -> Result<Response> {
         let mut resp = Response::new(status, reason)?;
 
@@ -220,8 +218,9 @@ impl Dialog {
 
         // Content-Length / body
         if let Some(b) = body {
-            resp.set_body(b);
-            let len_str = b.len().to_string();
+            resp.add_header(Header::new("Content-Type", b.0)?);
+            resp.set_body(b.1);
+            let len_str = b.1.len().to_string();
             resp.add_header(Header::new("Content-Length", &len_str)?);
         } else {
             resp.add_header(Header::new("Content-Length", "0")?);
@@ -230,37 +229,172 @@ impl Dialog {
         Ok(resp)
     }
 
-    /// Very small helper to interpret an incoming INVITE as a dialog start.
-    /// You can use this to produce a high-level "IncomingInvite" event.
-    pub fn classify_incoming_invite(&mut self, req: &Request) -> Result<SipDialogId> {
-        let call_id = header_value(&req.headers, "Call-ID")
-            .ok_or(SipError::Invalid("missing Call-ID"))?;
-        let from = header_value(&req.headers, "From")
-            .ok_or(SipError::Invalid("missing From"))?;
+    pub fn handle_incoming_invite(&mut self, req: Request) -> Vec<CoreEvent> {
+        let mut events = Vec::new();
 
-        // try to extract tag from From: ...;tag=foo
-        let remote_tag = parse_tag_param(from).unwrap_or("remote");
-
-        let mut cid = String::new();
-        cid.push_str(call_id);
-
-        let mut remote = String::new();
-        remote
-            .push_str(remote_tag);
-
-        let id = SipDialogId {
-            call_id: cid,
-            local_tag: String::new(),
-            remote_tag: remote,
+        let call_id = match header_value(&req.headers, "Call-ID") {
+            Some(v) => v,
+            None => {
+                log::debug!("handle_incoming_invite: missing Call-ID");
+                // Maybe return 400
+                return events;
+            }
         };
+
+        let from = match header_value(&req.headers, "From") {
+            Some(v) => v,
+            None => {
+                log::debug!("handle_incoming_invite: missing From");
+                return events;
+            }
+        };
+
+        let to = match header_value(&req.headers, "To") {
+            Some(v) => v,
+            None => {
+                log::debug!("handle_incoming_invite: missing To");
+                return events;
+            }
+        };
+
+        let from_tag = match parse_tag_param(from) {
+            Some(tag) => tag,
+            None => {
+                // No From tag: this is weird for an in-dialog INVITE, treat as new
+                log::debug!(
+                    "handle_incoming_invite: no From tag, treating as initial. call_id={}",
+                    call_id
+                );
+                self.handle_initial_invite(&req);
+                return events;
+            }
+        };
+
+        let to_tag = parse_tag_param(to);
+
+        log::debug!(
+            "handle_incoming_invite: call_id={} from_tag={:?} to_tag={:?} state={:?}",
+            call_id,
+            from_tag,
+            to_tag,
+            self.state,
+        );
+
+        // Decide if this matches the existing dialog
+        let in_dialog = match &self.state {
+            DialogState::Ringing { id, role, .. }
+            | DialogState::Established { id, role , .. } if *role == DialogRole::Uas => {
+                log::debug!(
+                    "handle_incoming_invite: current dialog id: call_id={} local_tag={:?} remote_tag={:?}",
+                    id.call_id,
+                    id.local_tag,
+                    id.remote_tag,
+                );
+
+                if id.call_id != call_id {
+                    log::debug!("handle_incoming_invite: Call-ID mismatch");
+                    false
+                } else if id.remote_tag != from_tag {
+                    log::debug!(
+                        "handle_incoming_invite: remote_tag mismatch: expected={:?} got={:?}",
+                        id.remote_tag,
+                        from_tag
+                    );
+                    false
+                } else if id.local_tag.is_empty() {
+                    // Early state: we haven't committed a local tag yet,
+                    // so we can't rely on To-tag matching.
+                    // Treat as "same dialog" based on Call-ID + remote tag alone.
+                    log::debug!(
+                        "handle_incoming_invite: local_tag empty, accepting based on Call-ID+remote_tag"
+                    );
+                    true
+                } else {
+                    // Fully formed dialog: require To-tag match as well.
+                    match to_tag {
+                        Some(tag) if tag == id.local_tag => {
+                            log::debug!("handle_incoming_invite: To-tag matches local_tag");
+                            true
+                        }
+                        Some(tag) => {
+                            log::debug!(
+                                "handle_incoming_invite: To-tag mismatch: expected={:?} got={:?}",
+                                id.local_tag,
+                                tag
+                            );
+                            false
+                        }
+                        None => {
+                            log::debug!(
+                                "handle_incoming_invite: missing To-tag but dialog has local_tag={:?}",
+                                id.local_tag
+                            );
+                            false
+                        },
+                    }
+                }
+            }
+            other_state => {
+                log::debug!(
+                    "handle_incoming_invite: state not considered in-dialog\r\n{:?}",
+                    other_state
+                );
+                false
+            },
+        };
+
+        if in_dialog {
+            // DO NOT reset state to Ringing here.
+            // Just emit "incoming INVITE, in-dialog"
+            log::debug!(
+                "handle_incoming_invite: classified as RE-INVITE (in-dialog) for Call-ID={}",
+                call_id
+            );
+            events.push(CoreEvent::Dialog(CoreDialogEvent::IncomingInvite {
+                request: req.clone(),
+                kind: InviteKind::Reinvite,
+            }));
+        } else {
+            log::debug!(
+                "handle_incoming_invite: classified INITIAL INVITE for Call-ID={}",
+                call_id
+            );
+            self.handle_initial_invite(&req);
+            events.push(CoreEvent::Dialog(CoreDialogEvent::IncomingInvite {
+                request: req,
+                kind: InviteKind::Initial,
+            }));
+        }
+        
+        events
+    }
+
+    fn handle_initial_invite(&mut self, req: &Request) {
+        let call_id = match header_value(&req.headers, "Call-ID") {
+            Some(v) => v,
+            None => return,
+        };
+
+        let from = match header_value(&req.headers, "From") {
+            Some(v) => v,
+            None => return,
+        };
+
+        let from_tag = match parse_tag_param(from) {
+            Some(tag) => tag,
+            None => return,
+        };
+
 
         self.state = DialogState::Ringing {
-            id: id.clone(),
             role: DialogRole::Uas,
+            id: SipDialogId {
+                call_id: call_id.to_string(),
+                local_tag: String::new(), // will be set when building 18x/200
+                remote_tag: from_tag.to_string(),
+            },
             original_invite: req.clone(),
         };
-
-        Ok(id)
     }
 
     /// Checks current call status. If incoming CANCEL matches the current call,

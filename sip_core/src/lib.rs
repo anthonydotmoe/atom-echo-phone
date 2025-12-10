@@ -27,7 +27,7 @@ pub use crate::dialog::{Dialog, DialogRole, DialogState, SipDialogId};
 
 pub use crate::stack::{
     CoreEvent, CoreRegistrationEvent, CoreDialogEvent,
-    SipStack
+    InviteKind, SipStack,
 };
 
 use thiserror::Error;

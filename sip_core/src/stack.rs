@@ -1,6 +1,8 @@
-use crate::{
-    Result, auth::DigestChallenge, dialog::{Dialog, DialogState, SipDialogId}, message::{Message, Method, Request, Response, header_value}, registration::{RegistrationResult, RegistrationState, RegistrationTransaction}
-};
+use crate::Result;
+use crate::auth::DigestChallenge;
+use crate::dialog::{Dialog, DialogState};
+use crate::message::{Message, Method, Request, Response, header_value};
+use crate::registration::{RegistrationResult, RegistrationState, RegistrationTransaction};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreRegistrationEvent {
@@ -9,9 +11,15 @@ pub enum CoreRegistrationEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InviteKind {
+    Initial,
+    Reinvite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreDialogEvent {
     IncomingInvite {
-        dialog_id: SipDialogId,
+        kind: InviteKind,
         request: Request,
     },
     DialogStateChanged(DialogState),
@@ -119,16 +127,8 @@ impl SipStack {
         req: Request,
         events: &mut Vec<CoreEvent>,
     ) {
-        // Classify as an incoming dialog; this will also set dialog state.
-        if let Ok(dialog_id) = self.dialog.classify_incoming_invite(&req) {
-            let _ = events.push(CoreEvent::Dialog(CoreDialogEvent::IncomingInvite {
-                dialog_id,
-                request: req,
-            }));
-            let _ = events.push(CoreEvent::Dialog(
-                CoreDialogEvent::DialogStateChanged(self.dialog.state.clone()),
-            ));
-        }
+        let dialog_events = self.dialog.handle_incoming_invite(req);
+        events.extend(dialog_events);
     }
 
     fn handle_incoming_cancel(
@@ -164,7 +164,7 @@ impl SipStack {
         req: Request,
         events: &mut Vec<CoreEvent>,
     ) {
-        if let Err(e) = self.dialog.handle_incoming_ack(&req) {
+        if let Err(_e) = self.dialog.handle_incoming_ack(&req) {
             // log::warn!("handle_incoming_ack: {:?}", e);
             return;
         }
