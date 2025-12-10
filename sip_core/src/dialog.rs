@@ -317,6 +317,77 @@ impl Dialog {
         })
     }
 
+    pub fn handle_incoming_ack(&mut self, ack_req: &Request) -> Result<()> {
+        // Only meaningful if we are UAS and currently ringing or already established
+        let (role, id) = match &self.state {
+            DialogState::Ringing { role, id, .. }
+            | DialogState::Established { role, id, .. } => (role, id),
+            _ => return Err(SipError::InvalidState("ACK in wrong state")),
+        };
+
+        if *role != DialogRole::Uas {
+            return Err(SipError::InvalidState("ACK but we are not UAS"));
+        }
+
+        // Light matching: Call-ID and To tag
+        let call_id = header_value(&ack_req.headers, "Call-ID")
+            .ok_or(SipError::Invalid("missing Call-ID"))?;
+        let to = header_value(&ack_req.headers, "To")
+            .ok_or(SipError::Invalid("missing To"))?;
+
+        let ack_to_tag = parse_tag_param(to).unwrap_or("");
+
+        if call_id != id.call_id || ack_to_tag != id.local_tag {
+            return Err(SipError::Invalid("ACK does not match current dialog"));
+        }
+
+        // Promote to Established if we were still Ringing
+        if matches!(self.state, DialogState::Ringing { .. }) {
+            self.state = DialogState::Established {
+                role: *role,
+                id: id.clone(),
+            };
+        }
+
+        Ok(())
+    }
+
+    pub fn handle_incoming_bye(&mut self, bye_req: &Request) -> Result<Response> {
+        let (role, id) = match &self.state {
+            DialogState::Established { role, id } => (role, id),
+            _ => return Err(SipError::InvalidState("BYE in wrong state")),
+        };
+
+        // For UAS: From is remote, To is local. For UAC it's reversed.
+        let call_id = header_value(&bye_req.headers, "Call-ID")
+            .ok_or(SipError::Invalid("missing Call-ID"))?;
+        let from = header_value(&bye_req.headers, "From")
+            .ok_or(SipError::Invalid("missing From"))?;
+        let to = header_value(&bye_req.headers, "To")
+            .ok_or(SipError::Invalid("missing To"))?;
+
+        let from_tag = parse_tag_param(from).unwrap_or("");
+        let to_tag = parse_tag_param(to).unwrap_or("");
+
+        let matches = if *role == DialogRole::Uas {
+            // remote = From, local = To
+            call_id == id.call_id && from_tag == id.remote_tag && to_tag == id.local_tag
+        } else {
+            // UAC: remote = To, local = From
+            call_id == id.call_id && to_tag == id.remote_tag && from_tag == id.local_tag
+        };
+
+        if !matches {
+            return Err(SipError::Invalid("BYE does not match current dialog"));
+        }
+
+        // Move dialog to Terminated
+        self.state = DialogState::Terminated;
+
+        // 200 OK for BYE
+        self.build_response_for_request(bye_req, 200, "OK", None)
+    }
+
     pub fn terminate_local(&mut self) {
         self.state = DialogState::Terminated;
     }

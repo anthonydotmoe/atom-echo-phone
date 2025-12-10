@@ -104,6 +104,8 @@ impl SipStack {
                 match req.method {
                     Method::Invite => self.handle_incoming_invite(req, &mut events),
                     Method::Cancel => self.handle_incoming_cancel(req, &mut events),
+                    Method::Ack    => self.handle_incoming_ack(req, &mut events),
+                    Method::Bye    => self.handle_incoming_bye(req, &mut events),
                     m => { log::warn!("on_message: unhandled request: {}", m); },
                 }
             }
@@ -153,6 +155,41 @@ impl SipStack {
             }
             Err(_e) => {
                 // log::warn!("handle_incoming_cancel: {:?}", e);
+            }
+        }
+    }
+
+    fn handle_incoming_ack(
+        &mut self,
+        req: Request,
+        events: &mut Vec<CoreEvent>,
+    ) {
+        if let Err(e) = self.dialog.handle_incoming_ack(&req) {
+            // log::warn!("handle_incoming_ack: {:?}", e);
+            return;
+        }
+
+        let _ = events.push(CoreEvent::Dialog(
+            CoreDialogEvent::DialogStateChanged(self.dialog.state.clone())
+        ));
+    }
+
+    fn handle_incoming_bye (
+        &mut self,
+        req: Request,
+        events: &mut Vec<CoreEvent>,
+    ) {
+        match self.dialog.handle_incoming_bye(&req) {
+            Ok(resp) => {
+                // send 200 OK for BYE
+                let _ = events.push(CoreEvent::SendResponse(resp));
+                // dialog is already moved to Terminated by the dialog helper
+                let _ = events.push(CoreEvent::Dialog(
+                    CoreDialogEvent::DialogStateChanged(self.dialog.state.clone())
+                ));
+            }
+            Err(_e) => {
+                // log::warn!("handle_incoming_bye: {:?}", e);
             }
         }
     }

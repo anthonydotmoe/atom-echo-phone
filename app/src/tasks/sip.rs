@@ -1,11 +1,7 @@
 use std::io::ErrorKind::WouldBlock;
 use std::net::{SocketAddr, UdpSocket};
-use std::{mem, thread};
+use std::thread;
 use std::time::{Duration, Instant};
-
-use heapless::String as HString;
-
-use atom_echo_hw::random_u32;
 
 use sip_core::{
     authorization_header, CoreDialogEvent, CoreEvent, CoreRegistrationEvent,
@@ -13,7 +9,11 @@ use sip_core::{
 };
 
 use crate::messages::{
-    self, AudioCommand, AudioCommandSender, ButtonEvent, RtpRxCommand, RtpRxCommandSender, RtpTxCommand, RtpTxCommandSender, SipCommand, SipCommandReceiver, UiCommand, UiCommandSender
+    self, AudioCommand, AudioCommandSender, ButtonEvent,
+    RtpRxCommand, RtpRxCommandSender,
+    RtpTxCommand, RtpTxCommandSender,
+    SipCommand, SipCommandReceiver,
+    UiCommand, UiCommandSender
 };
 
 pub fn spawn_sip_task(
@@ -134,6 +134,9 @@ impl SipTask {
         log::info!("SIP task started: local SIP {}:{}, RTP {}",
             self.local_ip, self.local_sip_port, self.local_rtp_port
         );
+
+        // Set initial LED
+        self.broadcast_phone_state();
 
         loop {
             let now = Instant::now();
@@ -408,10 +411,20 @@ impl SipTask {
         local_sdp: &sdp::SessionDescription,
     ) -> Result<(), sip_core::SipError> {
         let body = local_sdp.render().unwrap_or_default();
-        let resp = self
+        let mut resp = self
             .core
             .dialog
             .build_response_for_request(invite, 200, "OK", Some(&body))?;
+
+        resp.add_header(sip_core::Header::new("Content-Type", "application/sdp")?);
+
+        let contact_uri = build_contact_uri(
+            self.settings.sip_contact,
+            &self.local_ip,
+            self.local_sip_port,
+        );
+        let contact_value = format!("<{}>", contact_uri);
+        resp.add_header(sip_core::Header::new("Contact", &contact_value)?);
 
         let text = resp.render()?;
         log::debug!("Sending 200 OK:\r\n{}", text);
@@ -487,13 +500,65 @@ impl SipTask {
         }
     }
 
-    fn handle_button_event(&mut self, _event: ButtonEvent) {
-        log::info!("received button event")
+    fn handle_button_event(&mut self, event: ButtonEvent) {
+        log::info!("received button event {:?}", event);
+
+        match event {
+            ButtonEvent::ShortPress => self.handle_answer_or_hangup(),
+            _ => {}
+        }
         // TODO: wire in call control (answer, hangup, etc.)
         // Using:
         // - self.core.dialog.start_outgoing(...)
         // - self.core.dialog.build_bye(...)
         // - plus RTP commands and UI updates.
+    }
+
+    fn handle_answer_or_hangup(&mut self) {
+        match (&self.core.dialog.state, &self.call_ctx) {
+            // Incoming call, ringing: answer
+            (
+                sip_core::DialogState::Ringing { role, .. },
+                Some(ctx),
+            ) if *role == sip_core::DialogRole::Uas => {
+                // Build and send 200 OK + SDP, start RTP
+                //TODO: Make it work without clone
+                if let Err(e) = self.send_response_200_ok_with_sdp(&ctx.invite.clone(), &self.build_local_sdp()) {
+                    log::warn!("Failed to send 200 OK: {:?}", e);
+                }
+                // TODO: Flip the dialog state in core
+                if let Some(ref mut c) = self.call_ctx {
+                    c.ring_deadline = None;
+                }
+
+            }
+
+            // Established call: hang up
+            (
+                sip_core::DialogState::Established { .. },
+                Some(_ctx),
+            ) => {
+                // TODO: Build BYE, send it, stop RTP...
+                self.core.dialog.terminate_local();
+                self.broadcast_phone_state();
+                self.call_ctx = None;
+            }
+
+            // Button pressed in some other state
+            _ => {}
+        }
+    }
+
+    fn build_local_sdp(&self) -> sdp::SessionDescription {
+        sdp::SessionDescription {
+            origin: "-".to_string(),
+            connection_address: self.local_ip.clone(),
+            media: sdp::MediaDescription {
+                port: self.local_rtp_port,
+                payload_type: 0, // PCMU/8000
+                codec: sdp::Codec::Pcmu,
+            }
+        }
     }
 
     fn answer_call(&mut self) {}
