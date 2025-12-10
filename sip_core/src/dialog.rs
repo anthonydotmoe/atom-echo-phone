@@ -447,15 +447,26 @@ impl Dialog {
             ));
         }
 
-        let cancel_call_id = header_value(&cancel_req.headers, "Call-ID")
-            .ok_or(SipError::Invalid("missing Call-ID"))?;
-        let cancel_from = header_value(&cancel_req.headers, "From")
-            .ok_or(SipError::Invalid("missing From"))?;
+        let cancel_call_id = match header_value(&cancel_req.headers, "Call-ID") {
+            Some(v) => v,
+            None => {
+                self.state = DialogState::Ringing { role, id, original_invite };
+                return Err(SipError::Invalid("missing Call-ID"));
+            }
+        };
+        let cancel_from = match header_value(&cancel_req.headers, "From") {
+            Some(v) => v,
+            None => {
+                self.state = DialogState::Ringing { role, id, original_invite };
+                return Err(SipError::Invalid("missing From"));
+            }
+        };
         // try to extract tag from From: ...;tag=foo
         let cancel_remote_tag = parse_tag_param(cancel_from).unwrap_or("remote");
 
         // Same Call-ID and same remote tag -> this CANCEL is for our dialog
         if cancel_call_id != id.call_id || cancel_remote_tag != id.remote_tag {
+            self.state = DialogState::Ringing { role, id, original_invite };
             return Err(SipError::Invalid("CANCEL does not match current dialog"));
         }
         
