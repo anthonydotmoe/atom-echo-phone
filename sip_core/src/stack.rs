@@ -14,6 +14,7 @@ pub enum CoreRegistrationEvent {
 pub enum InviteKind {
     Initial,
     Reinvite,
+    InitialWhileBusy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

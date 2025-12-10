@@ -265,7 +265,12 @@ impl Dialog {
                     "handle_incoming_invite: no From tag, treating as initial. call_id={}",
                     call_id
                 );
-                self.handle_initial_invite(&req);
+                // do NOT change state here; just tell the app it's an initial
+                // attempt, and let it decide what to do.
+                events.push(CoreEvent::Dialog(CoreDialogEvent::IncomingInvite {
+                    request: req,
+                    kind: InviteKind::Initial,
+                }));
                 return events;
             }
         };
@@ -351,18 +356,37 @@ impl Dialog {
                 call_id
             );
             events.push(CoreEvent::Dialog(CoreDialogEvent::IncomingInvite {
-                request: req.clone(),
+                request: req,
                 kind: InviteKind::Reinvite,
             }));
-        } else {
+
+            return events;
+        }
+        
+        // Not in-dialog: This is some kind of initial INVITE.
+        // Decide whether we are free to accept a new dialog.
+        let can_start_new_dialog = matches!(self.state, DialogState::Idle | DialogState::Terminated);
+
+        if can_start_new_dialog {
             log::debug!(
                 "handle_incoming_invite: classified INITIAL INVITE for Call-ID={}",
                 call_id
             );
+
             self.handle_initial_invite(&req);
             events.push(CoreEvent::Dialog(CoreDialogEvent::IncomingInvite {
                 request: req,
                 kind: InviteKind::Initial,
+            }));
+        } else {
+            log::debug!(
+                "handle_incoming_invite: got NEW INVITE while busy in state {}, reporting InitialWhileBusy and not changing dialog state",
+                self.state
+            );
+
+            events.push(CoreEvent::Dialog(CoreDialogEvent::IncomingInvite {
+                request: req,
+                kind: InviteKind::InitialWhileBusy,
             }));
         }
         

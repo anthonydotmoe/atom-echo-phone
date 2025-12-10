@@ -5,9 +5,7 @@ use std::time::{Duration, Instant};
 
 use sdp::{MediaDescription, SessionDescription};
 use sip_core::{
-    authorization_header, CoreDialogEvent, CoreEvent, CoreRegistrationEvent,
-    DigestCredentials, InviteKind, RegistrationResult, RegistrationState,
-    SipStack,
+    CoreDialogEvent, CoreEvent, CoreRegistrationEvent, DigestCredentials, InviteKind, RegistrationResult, RegistrationState, SipStack, authorization_header, header_value
 };
 
 use crate::messages::{
@@ -43,6 +41,7 @@ struct CallContext {
     remote_sdp: SessionDescription,
     local_sdp: SessionDescription,
     ring_deadline: Option<Instant>, // Some(...) while ringing, None otherwise
+    remote_addr: SocketAddr,
 }
 
 struct SipTask {
@@ -314,8 +313,8 @@ impl SipTask {
             }
             CoreEvent::SendResponse(resp) => {
                 if let Ok(text) = resp.render() {
-                    log::debug!("Sending response:\r\n{}", text);
-                    send_sip(&self.sip_socket, &self.registrar, &text);
+                    log::debug!("Sending response");
+                    send_sip_addr(&self.sip_socket, remote_addr, &text);
                 } else {
                     log::warn!("Failed to render response");
                 }
@@ -345,11 +344,15 @@ impl SipTask {
         match ev {
             CoreDialogEvent::IncomingInvite { request, kind: InviteKind::Initial } => {
                 log::info!("Incoming INVITE from {}", remote_addr);
-                self.on_incoming_initial_invite(request);
+                self.on_incoming_initial_invite(request, remote_addr);
             }
             CoreDialogEvent::IncomingInvite { request, kind: InviteKind::Reinvite } => {
                 log::info!("Incoming re-INVITE from {}", remote_addr);
-                self.on_incoming_reinvite(request);
+                self.on_incoming_reinvite(request, remote_addr);
+            }
+            CoreDialogEvent::IncomingInvite { request, kind: InviteKind::InitialWhileBusy } => {
+                log::info!("Incoming INVITE while busy from {}, sending 486", remote_addr);
+                self.on_incoming_initial_while_busy(request, remote_addr);
             }
             CoreDialogEvent::DialogStateChanged(state) => {
                 log::info!("Dialog state -> {}", state);
@@ -359,7 +362,7 @@ impl SipTask {
         }
     }
 
-    fn on_incoming_initial_invite(&mut self, req: sip_core::Request) {
+    fn on_incoming_initial_invite(&mut self, req: sip_core::Request, remote_addr: SocketAddr) {
         if req.body.is_empty() {
             log::warn!("INVITE had no SDP body; ignoring");
             return;
@@ -370,7 +373,7 @@ impl SipTask {
             Err(e) => {
                 log::warn!("failed to parse SDP: {:?}", e);
                 if let Err(e) =
-                    self.send_response_488_not_acceptable_here(&req)
+                    self.send_response_488_not_acceptable_here(&req, remote_addr)
                 {
                     log::warn!("Failed to send 488 Not Acceptable Here: {:?}", e);
                 }
@@ -389,7 +392,7 @@ impl SipTask {
         );
 
         // Send 180 Ringing
-        self.send_response_180_ringing(&req);
+        self.send_response_180_ringing(&req, remote_addr);
 
         // Store state
         self.call_ctx = Some(CallContext {
@@ -397,6 +400,7 @@ impl SipTask {
             remote_sdp: sdp,
             local_sdp: self.build_local_sdp(),
             ring_deadline: Some(ring_deadline),
+            remote_addr,
         });
 
         // UI and audio
@@ -404,7 +408,7 @@ impl SipTask {
         let _ = self.audio_tx.send(AudioCommand::SetDialogState(PhoneState::Ringing));
     }
 
-    fn on_incoming_reinvite(&mut self, req: sip_core::Request) {
+    fn on_incoming_reinvite(&mut self, req: sip_core::Request, remote_addr: SocketAddr) {
         // Update remote SDP if provided
         if !req.body.is_empty() {
             match sdp::parse(req.body.as_str()) {
@@ -423,34 +427,41 @@ impl SipTask {
         // For now, just acknowledge with our current local SDP
         if let Some(ctx) = &self.call_ctx {
             let local_sdp = ctx.local_sdp.clone();
-            if let Err(e) = self.send_response_200_ok_with_sdp(&req, &local_sdp) {
+            if let Err(e) = self.send_response_200_ok_with_sdp(&req, remote_addr, &local_sdp) {
                 log::warn!("failed to respond to re-INVITE: {:?}", e);
             }
         } else {
             log::warn!("re-INVITE received but no call context; sending 481");
-            if let Err(e) = self.send_response_481_call_does_not_exist(&req) {
+            if let Err(e) = self.send_response_481_call_does_not_exist(&req, remote_addr) {
                 log::warn!("failed to send 481: {:?}", e);
             }
         }
     }
 
+    fn on_incoming_initial_while_busy(&mut self, req: sip_core::Request, remote_addr: SocketAddr) {
+        if let Err(e) = self.send_response_486_busy_here(&req, remote_addr) {
+            log::warn!("failed to respond to INVITE: {:?}", e);
+        }
+    }
+
     // --- Network responses ---------------------------------------------------
 
-    fn send_response_180_ringing(&mut self, invite: &sip_core::Request) -> Result<(), sip_core::SipError> {
+    fn send_response_180_ringing(&mut self, invite: &sip_core::Request, remote_addr: SocketAddr) -> Result<(), sip_core::SipError> {
         let resp = self
             .core
             .dialog
             .build_response_for_request(invite, 180, "Ringing", None)?;
 
         let text = resp.render()?;
-        log::debug!("Sending 180 Ringing:\r\n{}", text);
-        send_sip(&self.sip_socket, &self.registrar, &text);
+        log::debug!("Sending 180 Ringing");
+        send_sip_addr(&self.sip_socket, remote_addr, &text);
         Ok(())
     }
 
     fn send_response_200_ok_with_sdp(
         &mut self,
         invite: &sip_core::Request,
+        remote_addr: SocketAddr,
         local_sdp: &SessionDescription,
     ) -> Result<(), sip_core::SipError> {
         let body = local_sdp.render().unwrap_or_default();
@@ -468,14 +479,15 @@ impl SipTask {
         resp.add_header(sip_core::Header::new("Contact", &contact_value)?);
 
         let text = resp.render()?;
-        log::debug!("Sending 200 OK:\r\n{}", text);
-        send_sip(&self.sip_socket, &self.registrar, &text);
+        log::debug!("Sending 200 OK");
+        send_sip_addr(&self.sip_socket, remote_addr, &text);
         Ok(())
     }
 
     fn send_response_480_temporarily_unavailable(
         &mut self,
         invite: &sip_core::Request,
+        remote_addr: SocketAddr
     ) -> Result<(), sip_core::SipError> {
         let resp = self
             .core
@@ -483,14 +495,15 @@ impl SipTask {
             .build_response_for_request(invite, 480, "Temporarily Unavailable", None)?;
 
         let text = resp.render()?;
-        log::debug!("Sending 480 Temporarily Unavailable:\r\n{}", text);
-        send_sip(&self.sip_socket, &self.registrar, &text);
+        log::debug!("Sending 480 Temporarily Unavailable");
+        send_sip_addr(&self.sip_socket, remote_addr, &text);
         Ok(())
     }
 
     fn send_response_481_call_does_not_exist(
         &mut self,
         invite: &sip_core::Request,
+        remote_addr: SocketAddr
     ) -> Result<(), sip_core::SipError> {
         let resp = self
             .core
@@ -498,14 +511,15 @@ impl SipTask {
             .build_response_for_request(invite, 481, "Call/Transaction Does Not Exist", None)?;
 
         let text = resp.render()?;
-        log::debug!("Sending 481 Call/Transaction Does Not Exist:\r\n{}", text);
-        send_sip(&self.sip_socket, &self.registrar, &text);
+        log::debug!("Sending 481 Call/Transaction Does Not Exist");
+        send_sip_addr(&self.sip_socket, remote_addr, &text);
         Ok(())
     }
 
     fn send_response_486_busy_here(
         &mut self,
         invite: &sip_core::Request,
+        remote_addr: SocketAddr
     ) -> Result<(), sip_core::SipError> {
         let resp = self
             .core
@@ -513,14 +527,15 @@ impl SipTask {
             .build_response_for_request(invite, 486, "Busy Here", None)?;
 
         let text = resp.render()?;
-        log::debug!("Sending 486 Busy Here:\r\n{}", text);
-        send_sip(&self.sip_socket, &self.registrar, &text);
+        log::debug!("Sending 486 Busy Here");
+        send_sip_addr(&self.sip_socket, remote_addr, &text);
         Ok(())
     }
 
     fn send_response_488_not_acceptable_here(
         &mut self,
         invite: &sip_core::Request,
+        remote_addr: SocketAddr
     ) -> Result<(), sip_core::SipError> {
         let resp = self
             .core
@@ -528,8 +543,8 @@ impl SipTask {
             .build_response_for_request(invite, 488, "Not Acceptable Here", None)?;
 
         let text = resp.render()?;
-        log::debug!("Sending 488 Not Acceptable Here:\r\n{}", text);
-        send_sip(&self.sip_socket, &self.registrar, &text);
+        log::debug!("Sending 488 Not Acceptable Here");
+        send_sip_addr(&self.sip_socket, remote_addr, &text);
         Ok(())
     }
 
@@ -577,11 +592,16 @@ impl SipTask {
                 sip_core::DialogState::Ringing { role, .. },
                 Some(ctx),
             ) if *role == sip_core::DialogRole::Uas => {
+                // Clone what we need
+                let invite = ctx.invite.clone();
+                let local_sdp = ctx.local_sdp.clone();
+                let remote_addr = ctx.remote_addr;
+
                 // Build and send 200 OK + SDP, start RTP
-                //TODO: Make it work without clone
-                if let Err(e) = self.send_response_200_ok_with_sdp(&ctx.invite.clone(), &self.build_local_sdp()) {
+                if let Err(e) = self.send_response_200_ok_with_sdp(&invite, remote_addr, &local_sdp) {
                     log::warn!("Failed to send 200 OK: {:?}", e);
                 }
+
                 // TODO: Flip the dialog state in core
                 if let Some(ref mut c) = self.call_ctx {
                     c.ring_deadline = None;
@@ -649,7 +669,7 @@ impl SipTask {
             None => return,
         };
 
-        let _ = self.send_response_480_temporarily_unavailable(&ctx.invite);
+        let _ = self.send_response_480_temporarily_unavailable(&ctx.invite, ctx.remote_addr);
 
         // Move dialog to Terminated in core
         self.core.dialog.terminate_local();
@@ -675,16 +695,28 @@ impl SipTask {
 
 fn send_sip(socket: &UdpSocket, target: &str, payload: &str) {
     if let Ok(addr) = target.parse::<std::net::SocketAddr>() {
+        log::debug!("send_sip: to={:?}\r\n{}", addr, payload);
         let _ = socket.send_to(payload.as_bytes(), addr);
     } else if target.starts_with("sip:") {
         // try stripping scheme
-        if let Ok(addr) = target
-            .trim_start_matches("sip:")
-            .parse::<std::net::SocketAddr>()
-        {
-            let _ = socket.send_to(payload.as_bytes(), addr);
+        match target.trim_start_matches("sip:").parse::<std::net::SocketAddr>() {
+            Ok(addr) => {
+                log::debug!("send_sip: to={:?}\r\n{}", addr, payload);
+                let _ = socket.send_to(payload.as_bytes(), addr);
+            }
+            Err(e) => {
+                log::error!("send_sip: couldn't parse {} to SocketAddr: {:?}", target, e);
+
+            }
         }
+    } else {
+        log::error!("send_sip: couldn't parse {} to SocketAddr", target);
     }
+}
+
+fn send_sip_addr(socket: &UdpSocket, addr: SocketAddr, payload: &str) {
+    log::debug!("send_sip_addr: to={:?}\r\n{}", addr, payload);
+    let _ = socket.send_to(payload.as_bytes(), addr);
 }
 
 fn parse_uri(uri: &str) -> String {

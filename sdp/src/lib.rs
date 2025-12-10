@@ -171,7 +171,7 @@ pub fn parse(input: &str) -> Result<SessionDescription, SdpError> {
         }
     };
 
-    log::debug!("parsed:\r\n{:#?}", sdp);
+    //log::debug!("parsed:\r\n{:#?}", sdp);
 
     Ok(sdp)
 }
