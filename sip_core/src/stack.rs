@@ -3,6 +3,9 @@ use crate::auth::DigestChallenge;
 use crate::dialog::{Dialog, DialogState};
 use crate::message::{Message, Method, Request, Response, header_value};
 use crate::registration::{RegistrationResult, RegistrationState, RegistrationTransaction};
+use crate::transaction::InviteServerTransactionManager;
+use std::net::SocketAddr;
+use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreRegistrationEvent {
@@ -31,6 +34,10 @@ pub enum CoreEvent {
     Registration(CoreRegistrationEvent),
     Dialog(CoreDialogEvent),
     SendResponse(Response),
+    SendResponseTo {
+        response: Response,
+        target: SocketAddr,
+    },
 }
 
 /// High-level SIP stack that wires registration + dialog together,
@@ -39,6 +46,7 @@ pub enum CoreEvent {
 pub struct SipStack {
     pub registration: RegistrationTransaction,
     pub dialog: Dialog,
+    invite_transactions: InviteServerTransactionManager,
     last_reg_state: RegistrationState,
 }
 
@@ -81,10 +89,7 @@ impl SipStack {
     /// This does *not* perform any I/O. The caller is responsible for:
     /// - Parsing text into `Message` (via `parse_message`).
     /// - Sending any `Request`/`Response` objects the application chooses to build.
-    pub fn on_message(
-        &mut self,
-        msg: Message,
-    ) -> Vec<CoreEvent> {
+    pub fn on_message(&mut self, msg: Message, remote_addr: SocketAddr, now: Instant) -> Vec<CoreEvent> {
         let mut events: Vec<CoreEvent> = Vec::new();
 
         match msg {
@@ -111,9 +116,9 @@ impl SipStack {
             }
             Message::Request(req) => {
                 match req.method {
-                    Method::Invite => self.handle_incoming_invite(req, &mut events),
-                    Method::Cancel => self.handle_incoming_cancel(req, &mut events),
-                    Method::Ack    => self.handle_incoming_ack(req, &mut events),
+                    Method::Invite => self.handle_incoming_invite(req, remote_addr, &mut events),
+                    Method::Cancel => self.handle_incoming_cancel(req, remote_addr, now, &mut events),
+                    Method::Ack    => self.handle_incoming_ack(req, now, &mut events),
                     Method::Bye    => self.handle_incoming_bye(req, &mut events),
                     m => { log::warn!("on_message: unhandled request: {}", m); },
                 }
@@ -123,11 +128,29 @@ impl SipStack {
         events
     }
 
+    pub fn poll_timers(&mut self, now: Instant) -> Vec<CoreEvent> {
+        let mut events = Vec::new();
+        for (resp, target) in self.invite_transactions.poll(now) {
+            let _ = events.push(CoreEvent::SendResponseTo { response: resp, target });
+        }
+        events
+    }
+
+    /// Record an outgoing response so the stack can handle retransmissions.
+    pub fn record_outgoing_response(&mut self, resp: &Response, target: SocketAddr, now: Instant) {
+        self.invite_transactions.on_outgoing_response(resp, target, now);
+    }
+
     fn handle_incoming_invite(
         &mut self,
         req: Request,
+        remote_addr: SocketAddr,
         events: &mut Vec<CoreEvent>,
     ) {
+        if let Some(resp) = self.invite_transactions.on_invite(&req, remote_addr) {
+            let _ = events.push(CoreEvent::SendResponseTo { response: resp, target: remote_addr });
+        }
+
         let dialog_events = self.dialog.handle_incoming_invite(req);
         events.extend(dialog_events);
     }
@@ -135,15 +158,19 @@ impl SipStack {
     fn handle_incoming_cancel(
         &mut self,
         req: Request,
+        remote_addr: SocketAddr,
+        now: Instant,
         events: &mut Vec<CoreEvent>,
     ) {
         match self.dialog.handle_incoming_cancel(&req) {
             Ok(cancel_res) => {
                 // Emit the responses we must send
+                self.invite_transactions.on_outgoing_response(&cancel_res.cancel_ok, remote_addr, now);
                 let _ = events.push(
                     CoreEvent::SendResponse(cancel_res.cancel_ok),
                 );
                 if let Some(resp_487) = cancel_res.maybe_invite_487 {
+                    self.invite_transactions.on_outgoing_response(&resp_487, remote_addr, now);
                     let _ = events.push(
                         CoreEvent::SendResponse(resp_487),
                     );
@@ -163,8 +190,11 @@ impl SipStack {
     fn handle_incoming_ack(
         &mut self,
         req: Request,
+        now: Instant,
         events: &mut Vec<CoreEvent>,
     ) {
+        self.invite_transactions.on_ack(&req, now);
+
         if let Err(_e) = self.dialog.handle_incoming_ack(&req) {
             // log::warn!("handle_incoming_ack: {:?}", e);
             return;

@@ -149,6 +149,7 @@ impl SipTask {
                 break;
             }
             self.check_call_timeouts(now);
+            self.process_core_timers(now);
 
             thread::sleep(Duration::from_millis(10));
         }
@@ -284,7 +285,8 @@ impl SipTask {
                         match sip_core::parse_message(text) {
                             Ok(msg) => {
                                 log::debug!("parse_message ->\r\n{:?}", &msg);
-                                let events = self.core.on_message(msg);
+                                let now = Instant::now();
+                                let events = self.core.on_message(msg, addr, now);
                                 for ev in events {
                                     self.handle_core_event(ev, addr);
                                 }
@@ -317,6 +319,14 @@ impl SipTask {
                     send_sip_addr(&self.sip_socket, remote_addr, &text);
                 } else {
                     log::warn!("Failed to render response");
+                }
+            }
+            CoreEvent::SendResponseTo { response, target } => {
+                if let Ok(text) = response.render() {
+                    log::debug!("Sending response (timer)");
+                    send_sip_addr(&self.sip_socket, target, &text);
+                } else {
+                    log::warn!("Failed to render response from timer");
                 }
             }
         }
@@ -453,6 +463,7 @@ impl SipTask {
             .build_response_for_request(invite, 180, "Ringing", None)?;
 
         let text = resp.render()?;
+        self.core.record_outgoing_response(&resp, remote_addr, Instant::now());
         log::debug!("Sending 180 Ringing");
         send_sip_addr(&self.sip_socket, remote_addr, &text);
         Ok(())
@@ -479,6 +490,7 @@ impl SipTask {
         resp.add_header(sip_core::Header::new("Contact", &contact_value)?);
 
         let text = resp.render()?;
+        self.core.record_outgoing_response(&resp, remote_addr, Instant::now());
         log::debug!("Sending 200 OK");
         send_sip_addr(&self.sip_socket, remote_addr, &text);
         Ok(())
@@ -495,6 +507,7 @@ impl SipTask {
             .build_response_for_request(invite, 480, "Temporarily Unavailable", None)?;
 
         let text = resp.render()?;
+        self.core.record_outgoing_response(&resp, remote_addr, Instant::now());
         log::debug!("Sending 480 Temporarily Unavailable");
         send_sip_addr(&self.sip_socket, remote_addr, &text);
         Ok(())
@@ -511,6 +524,7 @@ impl SipTask {
             .build_response_for_request(invite, 481, "Call/Transaction Does Not Exist", None)?;
 
         let text = resp.render()?;
+        self.core.record_outgoing_response(&resp, remote_addr, Instant::now());
         log::debug!("Sending 481 Call/Transaction Does Not Exist");
         send_sip_addr(&self.sip_socket, remote_addr, &text);
         Ok(())
@@ -527,6 +541,7 @@ impl SipTask {
             .build_response_for_request(invite, 486, "Busy Here", None)?;
 
         let text = resp.render()?;
+        self.core.record_outgoing_response(&resp, remote_addr, Instant::now());
         log::debug!("Sending 486 Busy Here");
         send_sip_addr(&self.sip_socket, remote_addr, &text);
         Ok(())
@@ -543,6 +558,7 @@ impl SipTask {
             .build_response_for_request(invite, 488, "Not Acceptable Here", None)?;
 
         let text = resp.render()?;
+        self.core.record_outgoing_response(&resp, remote_addr, Instant::now());
         log::debug!("Sending 488 Not Acceptable Here");
         send_sip_addr(&self.sip_socket, remote_addr, &text);
         Ok(())
@@ -688,6 +704,17 @@ impl SipTask {
         let _ = self
             .audio_tx
             .send(AudioCommand::SetDialogState(phone));
+    }
+
+    fn process_core_timers(&mut self, now: Instant) {
+        let events = self.core.poll_timers(now);
+        for ev in events {
+            let target = match &ev {
+                CoreEvent::SendResponseTo { target, .. } => *target,
+                _ => SocketAddr::from(([0, 0, 0, 0], 0)),
+            };
+            self.handle_core_event(ev, target);
+        }
     }
 }
 

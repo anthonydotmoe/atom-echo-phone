@@ -8,6 +8,7 @@ mod auth;
 mod registration;
 mod dialog;
 mod stack;
+mod transaction;
 
 pub use crate::message::{
     header_value, parse_message, Header, HeaderList, Method, Message, Request,
