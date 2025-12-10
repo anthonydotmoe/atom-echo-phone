@@ -340,6 +340,9 @@ mod host {
     #[derive(Debug, Default)]
     pub struct DeviceInner;
 
+    #[derive(Debug, Default)]
+    pub struct UiDevice;
+
     pub fn init_device(config: WifiConfig) -> Result<DeviceInner, HardwareError> {
         debug!(
             "simulated Atom Echo init: ssid='{}'",
@@ -360,6 +363,12 @@ mod host {
             Ok(buf.len())
         }
 
+        pub fn get_ui_device(&mut self) -> Result<UiDevice, HardwareError> {
+            Ok(UiDevice {})
+        }
+    }
+
+    impl UiDevice {
         pub fn read_button_state(&self) -> ButtonState {
             ButtonState::Released
         }
