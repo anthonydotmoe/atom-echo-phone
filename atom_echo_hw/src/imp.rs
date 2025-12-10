@@ -11,7 +11,7 @@ mod esp {
     };
 
     use super::*;
-    use esp_idf_hal::gpio::AnyIOPin;
+    use esp_idf_hal::gpio::{AnyInputPin, InputPin, Pin};
     use esp_idf_hal::gpio::{Gpio39, Input, PinDriver};
     use esp_idf_hal::i2s::{config::StdConfig, I2sBiDir, I2sDriver};
     use esp_idf_hal::peripherals::Peripherals;
@@ -32,12 +32,12 @@ mod esp {
         ui_device: Option<UiDevice>,
         /*
         i2s: I2sDriver<'static, I2sBiDir>,
-        button: PinDriver<'static, Gpio39, Input>,
         */
     }
 
     pub struct UiDevice {
         led: TxRmtDriver<'static>,
+        button: PinDriver<'static, AnyInputPin, Input>,
     }
 
     pub fn init_device(config: WifiConfig) -> Result<DeviceInner, HardwareError> {
@@ -120,11 +120,11 @@ mod esp {
         .map_err(map_audio_err)?;
 
         log::info!("I2S configured for bidirectional audio");
+        */
 
         // Button input (pull-up, active-low)
         let button_pin = pins.gpio39;
-        let button = PinDriver::input(button_pin).map_err(map_gpio_err)?;
-        */
+        let button = PinDriver::input(button_pin.downgrade_input()).map_err(map_gpio_err)?;
 
         // LED via RMT-driven WS2812
         let led_pin = pins.gpio27;
@@ -137,9 +137,8 @@ mod esp {
 
         Ok(DeviceInner {
             wifi,
-            ui_device: Some(UiDevice { led }),
+            ui_device: Some(UiDevice { led, button }),
             //i2s,
-            //button,
         })
     }
 
@@ -169,18 +168,6 @@ mod esp {
             Ok(buf.len())
         }
         */
-
-        /*
-        pub fn read_button_state(&self) -> ButtonState {
-            // Active-low button: low means pressed.
-            if self.button.is_low() {
-                ButtonState::Pressed
-            } else {
-                ButtonState::Released
-            }
-        }
-        */
-
     }
 
     impl UiDevice {
@@ -214,6 +201,15 @@ mod esp {
             }
 
             self.led.start_blocking(&signal).map_err(map_gpio_err)
+        }
+
+        pub fn read_button_state(&self) -> ButtonState {
+            // Active-low button: low means pressed.
+            if self.button.is_low() {
+                ButtonState::Pressed
+            } else {
+                ButtonState::Released
+            }
         }
     }
 

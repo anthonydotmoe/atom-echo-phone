@@ -2,10 +2,10 @@ use std::sync::mpsc::TryRecvError;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use atom_echo_hw::{UiDevice, LedState};
+use atom_echo_hw::{ButtonState, LedState, UiDevice};
 
 use crate::messages::{
-    SipCommandSender, UiCommand, UiCommandReceiver, PhoneState
+    PhoneState, SipCommand, SipCommandSender, UiCommand, UiCommandReceiver
 };
 
 pub fn spawn_ui_task(
@@ -27,19 +27,25 @@ pub fn spawn_ui_task(
 struct UiTask {
     ui_device: UiDevice,
     ui_rx: UiCommandReceiver,
-    _sip_tx: SipCommandSender,
+    sip_tx: SipCommandSender,
+    last_button_state: ButtonState,
+    auto_answer_deadline: Option<Instant>,
 }
 
 impl UiTask {
     fn new(
         ui_device: UiDevice,
         ui_rx: UiCommandReceiver,
-        _sip_tx: SipCommandSender,
+        sip_tx: SipCommandSender,
     ) -> Self {
+        let initial_state = ui_device.read_button_state();
+
         Self {
             ui_device,
             ui_rx,
-            _sip_tx,
+            sip_tx,
+            last_button_state: initial_state,
+            auto_answer_deadline: None,
         }
     }
 
@@ -47,35 +53,55 @@ impl UiTask {
         log::info!("UI task started");
 
         loop {
-            let _now = Instant::now();
+            let now = Instant::now();
 
             if !self.poll_commands() {
                 log::info!("UI task exiting: command channel closed");
                 break;
             }
 
-            thread::sleep(Duration::from_millis(25));
+            self.poll_button();
+            self.poll_auto_answer(now);
+
+            thread::sleep(Duration::from_millis(40));
         }
     }
 
     fn handle_dialog_state_changed(&mut self, state: PhoneState) {
+        let now = Instant::now();
+        match state {
+            PhoneState::Ringing => {
+                // Only arm if not already armed
+                if self.auto_answer_deadline.is_none() {
+                    self.auto_answer_deadline = Some(now + Duration::from_secs(3));
+                    log::info!("auto-answer armed for 3 seconds");
+                }
+            }
+            _ => {
+                // Any non-ringing state cancels the auto-answer
+                if self.auto_answer_deadline.take().is_some() {
+                    log::info!("auto-answer cancelled");
+                }
+            }
+        }
+
         let led = match state {
             PhoneState::Idle => LedState::Color {
                 red: 0,
-                green: 127,
+                green: 16,
                 blue: 0,
             },
             PhoneState::Ringing => {
                 LedState::Color {
-                    red: 255,
-                    green: 127,
+                    red: 32,
+                    green: 16,
                     blue: 0,
                 }
             }
             PhoneState::Established => LedState::Color {
                 red: 0,
                 green: 0,
-                blue: 64,
+                blue: 16,
             },
         };
         log::debug!("ui_task: LED set for state {:?}", state);
@@ -102,6 +128,36 @@ impl UiTask {
             }
             UiCommand::DialogStateChanged(p) => {
                 self.handle_dialog_state_changed(p);
+            }
+        }
+    }
+
+    fn poll_button(&mut self) {
+        let state = self.ui_device.read_button_state();
+
+        // Edge: button was just pressed
+        if matches!(self.last_button_state, ButtonState::Released)
+            && matches!(state, ButtonState::Pressed)
+        {
+            log::info!("ui_task: button press detected");
+            let _ = self.sip_tx.send(SipCommand::Button(crate::messages::ButtonEvent::ShortPress));
+        }
+
+        self.last_button_state = state;
+    }
+
+    fn poll_auto_answer(&mut self, now: Instant) {
+        // Hack for broken button
+        if let Some(deadline) = self.auto_answer_deadline {
+            if now >= deadline {
+                log::info!("auto-answer timeout reached, simulating button");
+
+                // Send button pressed message after ring delay
+                let _ = self
+                    .sip_tx
+                    .send(SipCommand::Button(crate::messages::ButtonEvent::ShortPress));
+
+                self.auto_answer_deadline = None;
             }
         }
     }

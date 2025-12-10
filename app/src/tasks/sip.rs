@@ -488,6 +488,7 @@ impl SipTask {
     }
 
     fn handle_button_event(&mut self, _event: ButtonEvent) {
+        log::info!("received button event")
         // TODO: wire in call control (answer, hangup, etc.)
         // Using:
         // - self.core.dialog.start_outgoing(...)
