@@ -8,6 +8,8 @@
 
 use heapless::String;
 
+pub use crate::imp::UiDevice;
+
 pub type SmallString<const N: usize> = String<N>;
 
 #[derive(Debug, Clone)]
@@ -91,14 +93,20 @@ impl Device {
         Ok(Device { inner })
     }
 
-    /// Read a frame of PCM samples from the microphone.
-    ///
-    /// The exact semantics (frame size, blocking vs non-blocking) are
-    /// up to the caller; this function will try to fill `buf` and
-    /// return the number of samples actually read.
+    pub fn get_ui_device(&mut self) -> Result<UiDevice, HardwareError> {
+        self.inner.get_ui_device()
+    }
+
+    // Read a frame of PCM samples from the microphone.
+    //
+    // The exact semantics (frame size, blocking vs non-blocking) are
+    // up to the caller; this function will try to fill `buf` and
+    // return the number of samples actually read.
+    /*
     pub fn read_mic_frame(&mut self, buf: &mut [i16]) -> Result<usize, HardwareError> {
         self.inner.read_mic_frame(buf)
     }
+    */
 
     // Write a frame of PCM samples to the speaker.
     //

@@ -4,7 +4,6 @@ use super::{ButtonState, HardwareError, LedState, WifiConfig};
 mod esp {
     use std::time::Duration;
 
-    use esp_idf_svc::hal as esp_idf_hal;
     use esp_idf_svc::sys as esp_idf_sys;
     use esp_idf_sys::{
         esp_eap_client_set_password, esp_eap_client_set_username,
@@ -16,7 +15,7 @@ mod esp {
     use esp_idf_hal::gpio::{Gpio39, Input, PinDriver};
     use esp_idf_hal::i2s::{config::StdConfig, I2sBiDir, I2sDriver};
     use esp_idf_hal::peripherals::Peripherals;
-    use esp_idf_hal::rmt::{config::TransmitConfig, FixedLengthSignal, PinState, Pulse};
+    use esp_idf_hal::rmt::{config::TransmitConfig, FixedLengthSignal, PinState, Pulse, TxRmtDriver};
     use esp_idf_svc::eventloop::EspSystemEventLoop;
     use esp_idf_svc::wifi::{AuthMethod, ClientConfiguration, Configuration, EspWifi};
     use esp_idf_svc::nvs::EspDefaultNvsPartition;
@@ -30,11 +29,15 @@ mod esp {
     /// are implemented.
     pub struct DeviceInner {
         wifi: EspWifi<'static>,
+        ui_device: Option<UiDevice>,
         /*
         i2s: I2sDriver<'static, I2sBiDir>,
         button: PinDriver<'static, Gpio39, Input>,
-        led: TxRmtDriver<'static>,
         */
+    }
+
+    pub struct UiDevice {
+        led: TxRmtDriver<'static>,
     }
 
     pub fn init_device(config: WifiConfig) -> Result<DeviceInner, HardwareError> {
@@ -92,9 +95,10 @@ mod esp {
         log::info!("Wi-Fi connected");
         log::info!("IP: {}", ip);
 
+        let pins = peripherals.pins;
+
         /*
         // --- I2S audio ---
-        let pins = peripherals.pins;
 
         let bclk = pins.gpio19;
         let din = pins.gpio23;
@@ -120,6 +124,7 @@ mod esp {
         // Button input (pull-up, active-low)
         let button_pin = pins.gpio39;
         let button = PinDriver::input(button_pin).map_err(map_gpio_err)?;
+        */
 
         // LED via RMT-driven WS2812
         let led_pin = pins.gpio27;
@@ -129,17 +134,24 @@ mod esp {
             &TransmitConfig::new().clock_divider(2),
         )
         .map_err(map_gpio_err)?;
-        */
 
         Ok(DeviceInner {
             wifi,
+            ui_device: Some(UiDevice { led }),
             //i2s,
             //button,
-            //led,
         })
     }
 
     impl DeviceInner {
+        pub fn get_ui_device(&mut self) -> Result<UiDevice, HardwareError> {
+            if self.ui_device.is_none() {
+                return Err(HardwareError::Other("UiDevice already taken"));
+            }
+
+            Ok(self.ui_device.take().unwrap())
+        }
+
         pub fn read_mic_frame(&mut self, buf: &mut [i16]) -> Result<usize, HardwareError> {
             // TODO: implement real I2S read
             //
@@ -169,7 +181,9 @@ mod esp {
         }
         */
 
-        /*
+    }
+
+    impl UiDevice {
         pub fn set_led_state(&mut self, state: LedState) -> Result<(), HardwareError> {
             let (g, r, b) = match state {
                 LedState::Off => (0, 0, 0),
@@ -201,7 +215,6 @@ mod esp {
 
             self.led.start_blocking(&signal).map_err(map_gpio_err)
         }
-    */
     }
 
     fn map_wifi_err(err: EspError) -> HardwareError {
@@ -367,9 +380,9 @@ mod host {
 }
 
 #[cfg(target_os = "espidf")]
-pub use esp::{DeviceInner, random_u32};
+pub use esp::{DeviceInner, UiDevice, random_u32};
 #[cfg(not(target_os = "espidf"))]
-pub use host::{DeviceInner, random_u32};
+pub use host::{DeviceInner, UiDevice, random_u32};
 
 #[cfg(target_os = "espidf")]
 pub use esp::init_device;

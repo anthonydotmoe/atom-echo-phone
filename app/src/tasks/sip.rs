@@ -13,15 +13,13 @@ use sip_core::{
 };
 
 use crate::messages::{
-    AudioCommand, AudioCommandSender, ButtonEvent,
-    RtpRxCommand, RtpRxCommandSender,
-    RtpTxCommand, RtpTxCommandSender,
-    SipCommand, SipCommandReceiver
+    self, AudioCommand, AudioCommandSender, ButtonEvent, RtpRxCommand, RtpRxCommandSender, RtpTxCommand, RtpTxCommandSender, SipCommand, SipCommandReceiver, UiCommand, UiCommandSender
 };
 
 pub fn spawn_sip_task(
     settings: &'static crate::settings::Settings,
     sip_rx: SipCommandReceiver,
+    ui_tx: UiCommandSender,
     audio_tx: AudioCommandSender,
     rtp_tx_tx: RtpTxCommandSender,
     rtp_rx_tx: RtpRxCommandSender,
@@ -31,39 +29,32 @@ pub fn spawn_sip_task(
         .name("sip".into())
         .spawn(move || {
             let mut task = Box::new(
-                SipTask::new(settings, sip_rx, audio_tx, rtp_tx_tx, rtp_rx_tx)
+                SipTask::new(settings, sip_rx, ui_tx, audio_tx, rtp_tx_tx, rtp_rx_tx)
             );
             task.run();
     })
     .expect("failed to spawn SIP task")
 }
 
-#[derive(Debug, Default)]
-enum CallState {
-    #[default]
-    Idle,
-    Ringing {
-        invite: sip_core::Request,
-        remote_sdp: sdp::SessionDescription,
-        ring_deadline: Instant,
-    },
-    Established {
-        invite: sip_core::Request,
-        remote_sdp: sdp::SessionDescription,
-    },
+#[derive(Debug)]
+struct CallContext {
+    invite: sip_core::Request,
+    remote_sdp: sdp::SessionDescription,
+    ring_deadline: Option<Instant>, // Some(...) while ringing, None otherwise
 }
 
 struct SipTask {
     // App wiring
     settings: &'static crate::settings::Settings,
     sip_rx: SipCommandReceiver,
+    ui_tx: UiCommandSender,
     audio_tx: AudioCommandSender,
     rtp_tx_tx: RtpTxCommandSender,
     rtp_rx_tx: RtpRxCommandSender,
 
     // Core SIP logic
     core: SipStack,
-    call_state: CallState,
+    call_ctx: Option<CallContext>,
     ring_timeout: Duration,
 
     // Networking
@@ -86,6 +77,7 @@ impl SipTask {
     fn new(
         settings: &'static crate::settings::Settings,
         sip_rx: SipCommandReceiver,
+        ui_tx: UiCommandSender,
         audio_tx: AudioCommandSender,
         rtp_tx_tx: RtpTxCommandSender,
         rtp_rx_tx: RtpRxCommandSender,
@@ -116,12 +108,13 @@ impl SipTask {
         Self {
             settings,
             sip_rx,
+            ui_tx,
             audio_tx,
             rtp_tx_tx,
             rtp_rx_tx,
 
             core,
-            call_state: CallState::Idle,
+            call_ctx: None,
             ring_timeout: Duration::from_secs(settings.ring_timeout as u64),
 
             rx_buf: [0u8; 1500],
@@ -349,10 +342,8 @@ impl SipTask {
                 self.on_incoming_invite(request);
             }
             CoreDialogEvent::DialogStateChanged(state) => {
-                log::info!("Dialog state -> {:?}", state);
-                let _ = self
-                    .audio_tx
-                    .send(AudioCommand::SetDialogState(state));
+                log::info!("Dialog state -> {}", state);
+                self.broadcast_phone_state();
             }
         }
     }
@@ -389,15 +380,12 @@ impl SipTask {
         // Send 180 Ringing
         self.send_response_180_ringing(&req);
 
-        // Tell UI
-        //TODO: let _ = self.ui_tx.send(UiCommand::SetLed::Ringing);
-
         // Store state
-        self.call_state = CallState::Ringing {
+        self.call_ctx = Some(CallContext {
             invite: req,
             remote_sdp: sdp,
-            ring_deadline,
-        };
+            ring_deadline: Some(ring_deadline),
+        });
     }
 
     // --- Network responses ---------------------------------------------------
@@ -510,29 +498,54 @@ impl SipTask {
     fn answer_call(&mut self) {}
 
     fn end_call(&mut self) {
-        self.call_state = CallState::Idle;
+        self.call_ctx = None;
     }
 
     fn check_call_timeouts(&mut self, now: Instant) {
-        // Take current state so we can move from it
-        let old_state = mem::replace(&mut self.call_state, CallState::Idle);
-
-        let (ring_deadline, invite) = match old_state {
-            CallState::Ringing { ref ring_deadline, ref invite, .. } => (ring_deadline, invite),
-            _ => {
-                // No timeout, restore state
-                self.call_state = old_state;
-                return;
+        let should_timeout = match (&self.core.dialog.state, &self.call_ctx) {
+            (
+                sip_core::DialogState::Ringing { role, .. },
+                Some(ctx),
+            ) if *role == sip_core::DialogRole::Uas => {
+                match ctx.ring_deadline {
+                    Some(deadline) => now >= deadline,
+                    None => false,
+                }
             }
+            _ => false,
         };
 
-        if now >= *ring_deadline {
-            log::info!("Ringing timed out: sending 480 and returning to idle");
-            self.send_response_480_temporarily_unavailable(&invite);
-            self.end_call();
-        } else {
-            self.call_state = old_state;
+        if !should_timeout {
+            return;
         }
+
+        log::info!("Ringing timed out: sending 480 and returning to idle");
+
+        // Take the context out of self so we don't keep an immutable borrow
+        let ctx = match self.call_ctx.take() {
+            Some(ctx) => ctx,
+            None => return,
+        };
+
+        let _ = self.send_response_480_temporarily_unavailable(&ctx.invite);
+
+        // Move dialog to Terminated in core
+        self.core.dialog.terminate_local();
+        self.broadcast_phone_state();
+
+        self.call_ctx = None;
+    }
+
+    fn broadcast_phone_state(&mut self) {
+        let phone = dialog_state_to_phone_state(&self.core.dialog.state);
+
+        let _ = self
+            .ui_tx
+            .send(UiCommand::DialogStateChanged(phone.clone()));
+
+        let _ = self
+            .audio_tx
+            .send(AudioCommand::SetDialogState(phone));
     }
 }
 
@@ -574,6 +587,16 @@ fn local_ip_port(sock: &UdpSocket) -> (String, u16) {
         .local_addr()
         .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
     (addr.ip().to_string(), addr.port())
+}
+
+fn dialog_state_to_phone_state(dialog_state: &sip_core::DialogState) -> messages::PhoneState {
+    match dialog_state {
+        &sip_core::DialogState::Idle => messages::PhoneState::Idle,
+        &sip_core::DialogState::Inviting => messages::PhoneState::Ringing,
+        &sip_core::DialogState::Ringing { .. } => messages::PhoneState::Ringing,
+        &sip_core::DialogState::Established { .. } => messages::PhoneState::Established,
+        &sip_core::DialogState::Terminated => messages::PhoneState::Idle,
+    }
 }
 
 // --- Stack size logging facility ---------------------------------------------

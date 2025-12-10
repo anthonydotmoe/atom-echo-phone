@@ -28,18 +28,20 @@ pub fn run() -> Result<(), AppError> {
     )
         .map_err(|err| AppError::Hardware(format!("{err:?}")))?;
 
-    let _device = Device::init(wifi_config)
+    let mut device = Device::init(wifi_config)
         .map_err(|err| AppError::Hardware(format!("{err:?}")))?;
 
     // Create channels
-    let (_sip_tx, sip_rx) = channel::<messages::SipCommand>();
+    let (sip_tx, sip_rx) = channel::<messages::SipCommand>();
     let (audio_tx, _audio_rx) = channel::<messages::AudioCommand>();
     let (rtp_tx_tx, _rtp_tx_rx) = channel::<messages::RtpTxCommand>();
     let (rtp_rx_tx, _rtp_rx_rx) = channel::<messages::RtpRxCommand>();
-    let (_ui_tx, _ui_rx) = channel::<messages::UiCommand>();
+    let (ui_tx, ui_rx) = channel::<messages::UiCommand>();
     let (_media_in_tx, _media_in_rx) = channel::<messages::MediaIn>();
     let (_media_out_tx, _media_out_rx) = channel::<messages::MediaOut>();
 
+    // Split device
+    let ui_device = device.get_ui_device().unwrap();
     /*
     TODO: Just mapping out who needs what
 
@@ -52,8 +54,8 @@ pub fn run() -> Result<(), AppError> {
     RTP RX -> Audio (speaker): MediaIn
     */
 
-    //let _ui_handle = tasks::ui::spawn_ui_task(device, ui_rx, sip_tx);
-    let _sip_handle = tasks::sip::spawn_sip_task(&settings::SETTINGS, sip_rx, audio_tx, rtp_tx_tx, rtp_rx_tx);
+    let _ui_handle = tasks::ui::spawn_ui_task(ui_device, ui_rx, sip_tx);
+    let _sip_handle = tasks::sip::spawn_sip_task(&settings::SETTINGS, sip_rx, ui_tx, audio_tx, rtp_tx_tx, rtp_rx_tx);
 
     /*
     let _rtp_tx_handle = tasks::rtp_tx::spawn_rtp_tx_task(rtp_tx_rx);

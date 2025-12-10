@@ -2,7 +2,6 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use atom_echo_hw::{ButtonState, LedState};
 use heapless::{String as HString, Vec as HVec};
-use sip_core::DialogState;
 
 /// High-level call mode from the perspective of audio:
 /// - Idle: no call
@@ -38,7 +37,7 @@ pub enum AudioCommand {
 
     /// Inform audio of call state if it needs to behave differently
     /// (e.g. play ringback tone vs remote audio)
-    SetDialogState(DialogState),
+    SetDialogState(PhoneState),
 
     // TODO: For things like comfort noise generation, tones, etc.,
     // PlayTone(ToneKind)
@@ -79,9 +78,16 @@ pub enum RtpRxCommand {
 pub type RtpRxCommandSender = Sender<RtpRxCommand>;
 pub type RtpRxCommandReceiver = Receiver<RtpRxCommand>;
 
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum PhoneState {
+    Idle,
+    Ringing,
+    Established,
+}
+
 #[derive(Debug)]
 pub enum UiCommand {
-    DialogStateChanged(DialogState),
+    DialogStateChanged(PhoneState),
     SetLed(LedState),
 }
 

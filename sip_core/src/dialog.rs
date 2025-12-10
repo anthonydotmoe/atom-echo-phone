@@ -1,5 +1,6 @@
 use core::fmt::Write;
 use core::mem;
+use std::fmt::Display;
 
 use crate::{
     header_value,
@@ -26,6 +27,18 @@ pub enum DialogState {
 impl Default for DialogState {
     fn default() -> Self {
         DialogState::Idle
+    }
+}
+
+impl Display for DialogState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            &DialogState::Idle => f.write_str("Idle"),
+            &DialogState::Inviting => f.write_str("Inviting"),
+            &DialogState::Ringing {..} => f.write_str("Ringing"),
+            &DialogState::Established {..} => f.write_str("Established"),
+            &DialogState::Terminated => f.write_str("Terminated"),
+        }
     }
 }
 
@@ -302,6 +315,10 @@ impl Dialog {
             cancel_ok,
             maybe_invite_487: Some(invite_487),
         })
+    }
+
+    pub fn terminate_local(&mut self) {
+        self.state = DialogState::Terminated;
     }
 }
 
