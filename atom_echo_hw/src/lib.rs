@@ -8,7 +8,7 @@
 
 use heapless::String;
 
-pub use crate::imp::UiDevice;
+pub use crate::imp::{AudioDevice, UiDevice};
 
 pub type SmallString<const N: usize> = String<N>;
 
@@ -93,43 +93,13 @@ impl Device {
         Ok(Device { inner })
     }
 
+    pub fn get_audio_device(&mut self) -> Result<AudioDevice, HardwareError> {
+        self.inner.get_audio_device()
+    }
+
     pub fn get_ui_device(&mut self) -> Result<UiDevice, HardwareError> {
         self.inner.get_ui_device()
     }
-
-    // Read a frame of PCM samples from the microphone.
-    //
-    // The exact semantics (frame size, blocking vs non-blocking) are
-    // up to the caller; this function will try to fill `buf` and
-    // return the number of samples actually read.
-    /*
-    pub fn read_mic_frame(&mut self, buf: &mut [i16]) -> Result<usize, HardwareError> {
-        self.inner.read_mic_frame(buf)
-    }
-    */
-
-    // Write a frame of PCM samples to the speaker.
-    //
-    // Returns the number of samples accepted.
-    /*
-    pub fn write_speaker_frame(&mut self, buf: &[i16]) -> Result<usize, HardwareError> {
-        self.inner.write_speaker_frame(buf)
-    }
-    */
-
-    // Read the current debounced button state.
-    /*
-    pub fn read_button_state(&self) -> ButtonState {
-        self.inner.read_button_state()
-    }
-    */
-
-    // Set the neopixel LED to a given state.
-    /*
-    pub fn set_led_state(&mut self, state: LedState) -> Result<(), HardwareError> {
-        self.inner.set_led_state(state)
-    }
-    */
 }
 
 // Platform-specific implementation lives in `imp`:

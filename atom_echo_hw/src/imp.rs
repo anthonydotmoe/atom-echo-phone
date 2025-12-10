@@ -11,13 +11,13 @@ mod esp {
     };
 
     use super::*;
-    use esp_idf_hal::gpio::{AnyInputPin, InputPin, Pin};
-    use esp_idf_hal::gpio::{Gpio39, Input, PinDriver};
-    use esp_idf_hal::i2s::{config::StdConfig, I2sBiDir, I2sDriver};
+    use esp_idf_hal::gpio::{AnyIOPin, AnyInputPin, InputPin};
+    use esp_idf_hal::gpio::{Input, PinDriver};
+    use esp_idf_hal::i2s::{config::StdConfig, I2sTx, I2sDriver};
     use esp_idf_hal::peripherals::Peripherals;
     use esp_idf_hal::rmt::{config::TransmitConfig, FixedLengthSignal, PinState, Pulse, TxRmtDriver};
     use esp_idf_svc::eventloop::EspSystemEventLoop;
-    use esp_idf_svc::wifi::{AuthMethod, ClientConfiguration, Configuration, EspWifi};
+    use esp_idf_svc::wifi::{ClientConfiguration, Configuration, EspWifi};
     use esp_idf_svc::nvs::EspDefaultNvsPartition;
     use esp_idf_sys::esp_eap_client_set_identity;
     use esp_idf_sys::EspError;
@@ -30,9 +30,12 @@ mod esp {
     pub struct DeviceInner {
         wifi: EspWifi<'static>,
         ui_device: Option<UiDevice>,
-        /*
-        i2s: I2sDriver<'static, I2sBiDir>,
-        */
+        audio_device: Option<AudioDevice>,
+    }
+
+    pub struct AudioDevice {
+        speaker: I2sDriver<'static, I2sTx>,
+        /* mic: I2sDriver<'static, I2sRx>, */
     }
 
     pub struct UiDevice {
@@ -97,29 +100,47 @@ mod esp {
 
         let pins = peripherals.pins;
 
-        /*
         // --- I2S audio ---
 
         let bclk = pins.gpio19;
-        let din = pins.gpio23;
+        let _din = pins.gpio23;
         let dout = pins.gpio22;
         let ws = pins.gpio33;
 
         // 16-bit PCM at 8 kHz, Philips standard.
-        let std_config = StdConfig::philips(8_000, esp_idf_hal::i2s::config::DataBitWidth::Bits16);
+        let speaker_config = StdConfig::philips(8_000, esp_idf_hal::i2s::config::DataBitWidth::Bits16);
 
-        let i2s = I2sDriver::<I2sBiDir>::new_std_bidir(
+        let speaker = I2sDriver::<I2sTx>::new_std_tx(
             peripherals.i2s0,
-            &std_config,
+            &speaker_config,
             bclk,
-            din,
             dout,
             Option::<AnyIOPin>::None,
-            ws,
+            ws
         )
         .map_err(map_audio_err)?;
 
-        log::info!("I2S configured for bidirectional audio");
+        /*
+        // PDM
+        let mic_config = {
+            let channel_cfg = i2s::config::Config::default();
+            let clk_cfg = i2s::config::PdmRxClkConfig::from_sample_rate_hz(8_000);
+            let slot_cfg = i2s::config::PdmRxSlotConfig::from_bits_per_sample_and_slot_mode(
+                i2s::config::DataBitWidth::Bits16,
+                i2s::config::SlotMode::Mono,
+            );
+            let gpio_cfg = i2s::config::PdmRxGpioConfig::new(false);
+
+            PdmRxConfig::new(channel_cfg, clk_cfg, slot_cfg, gpio_cfg)
+        };
+
+        let mic = I2sDriver::<I2sRx>::new_pdm_rx(
+            peripherals.i2s1,
+            &mic_config,
+            bclk,
+            din
+        )
+        .map_err(map_audio_err)?;
         */
 
         // Button input (pull-up, active-low)
@@ -138,11 +159,19 @@ mod esp {
         Ok(DeviceInner {
             wifi,
             ui_device: Some(UiDevice { led, button }),
-            //i2s,
+            audio_device: Some(AudioDevice { speaker: speaker, /* mic: mic */ })
         })
     }
 
     impl DeviceInner {
+        pub fn get_audio_device(&mut self) -> Result<AudioDevice, HardwareError> {
+            if self.audio_device.is_none() {
+                return Err(HardwareError::Other("AudioDevice already taken"));
+            }
+
+            Ok(self.audio_device.take().unwrap())
+        }
+
         pub fn get_ui_device(&mut self) -> Result<UiDevice, HardwareError> {
             if self.ui_device.is_none() {
                 return Err(HardwareError::Other("UiDevice already taken"));
@@ -150,7 +179,9 @@ mod esp {
 
             Ok(self.ui_device.take().unwrap())
         }
+    }
 
+    impl AudioDevice {
         pub fn read_mic_frame(&mut self, buf: &mut [i16]) -> Result<usize, HardwareError> {
             // TODO: implement real I2S read
             //
@@ -160,14 +191,13 @@ mod esp {
             Ok(buf.len())
         }
 
-        /*
         pub fn write_speaker_frame(&mut self, buf: &[i16]) -> Result<usize, HardwareError> {
             // TODO: implement real I2S write
-            let _ = &self.i2s; // keep field "used" for now
+            let _ = &self.speaker; // keep field "used" for now
             let _ = buf;
             Ok(buf.len())
         }
-        */
+
     }
 
     impl UiDevice {
@@ -341,6 +371,9 @@ mod host {
     pub struct DeviceInner;
 
     #[derive(Debug, Default)]
+    pub struct AudioDevice;
+
+    #[derive(Debug, Default)]
     pub struct UiDevice;
 
     pub fn init_device(config: WifiConfig) -> Result<DeviceInner, HardwareError> {
@@ -352,6 +385,16 @@ mod host {
     }
 
     impl DeviceInner {
+        pub fn get_audio_device(&mut self) -> Result<AudioDevice, HardwareError> {
+            Ok(AudioDevice {})
+        }
+
+        pub fn get_ui_device(&mut self) -> Result<UiDevice, HardwareError> {
+            Ok(UiDevice)
+        }
+    }
+    
+    impl AudioDevice {
         pub fn read_mic_frame(&mut self, buf: &mut [i16]) -> Result<usize, HardwareError> {
             // host: just zero-fill
             buf.fill(0);
@@ -361,10 +404,6 @@ mod host {
         pub fn write_speaker_frame(&mut self, buf: &[i16]) -> Result<usize, HardwareError> {
             debug!("simulated speaker write: {} samples", buf.len());
             Ok(buf.len())
-        }
-
-        pub fn get_ui_device(&mut self) -> Result<UiDevice, HardwareError> {
-            Ok(UiDevice {})
         }
     }
 
@@ -385,9 +424,9 @@ mod host {
 }
 
 #[cfg(target_os = "espidf")]
-pub use esp::{DeviceInner, UiDevice, random_u32};
+pub use esp::{DeviceInner, AudioDevice, UiDevice, random_u32};
 #[cfg(not(target_os = "espidf"))]
-pub use host::{DeviceInner, UiDevice, random_u32};
+pub use host::{DeviceInner, AudioDevice, UiDevice, random_u32};
 
 #[cfg(target_os = "espidf")]
 pub use esp::init_device;
