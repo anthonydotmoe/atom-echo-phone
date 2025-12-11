@@ -144,7 +144,40 @@ pub fn encode_ulaw(samples: &[i16]) -> Vec<u8, 512> {
     out
 }
 
+#[cfg(feature = "table_decode")]
+const ULAW_DECODE_TABLE: [i16; 256] = {
+    let mut t = [0i16; 256];
+    let mut i = 0;
+    while i < 256 {
+        let b = i as u8;
+        let byte = !b;
+        let sign = (byte & 0x80) != 0;
+        let exponent = (byte >> 4) & 0x07;
+        let mantissa = byte & 0x0F;
+
+        let mut magnitude = ((mantissa as i32) << 3) + ULAW_BIAS;
+        magnitude <<= exponent as i32;
+        magnitude -= ULAW_BIAS;
+        let sample = if sign { -magnitude } else { magnitude } as i16;
+
+        t[i] = sample;
+        i += 1;
+    }
+    t
+};
+
+#[cfg(feature = "table_decode")]
 pub fn decode_ulaw(bytes: &[u8]) -> Vec<i16, 512> {
+    let mut out: Vec<i16, 512> = Vec::new();
+    for &b in bytes {
+        let sample = ULAW_DECODE_TABLE[b as usize];
+        let _ = out.push(sample);
+    }
+    out
+}
+
+#[cfg(not(feature = "table_decode"))]
+pub fn compute_decode_ulaw(bytes: &[u8]) -> Vec<i16, 512> {
     let mut out: Vec<i16, 512> = Vec::new();
     for &b in bytes {
         let byte = !b as u8;

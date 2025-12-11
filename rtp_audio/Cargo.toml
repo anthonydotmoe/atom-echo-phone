@@ -4,6 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+table_decode = []
+
 [dependencies]
 thiserror.workspace = true
 heapless.workspace = true
