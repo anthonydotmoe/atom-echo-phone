@@ -1,8 +1,9 @@
 use std::io::ErrorKind::WouldBlock;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use heapless::String as HString;
 use sdp::{MediaDescription, SessionDescription};
 use sip_core::{
     CoreDialogEvent, CoreEvent, CoreRegistrationEvent, DigestCredentials, InviteKind, RegistrationResult, RegistrationState, SipStack, authorization_header, header_value
@@ -17,6 +18,8 @@ use crate::messages::{
 
 pub fn spawn_sip_task(
     settings: &'static crate::settings::Settings,
+    addr: Ipv4Addr,
+    local_rtp_port: u16,
     sip_rx: SipCommandReceiver,
     ui_tx: UiCommandSender,
     audio_tx: AudioCommandSender,
@@ -28,7 +31,7 @@ pub fn spawn_sip_task(
         .name("sip".into())
         .spawn(move || {
             let mut task = Box::new(
-                SipTask::new(settings, sip_rx, ui_tx, audio_tx, rtp_tx_tx, rtp_rx_tx)
+                SipTask::new(settings, addr, local_rtp_port, sip_rx, ui_tx, audio_tx, rtp_tx_tx, rtp_rx_tx)
             );
             task.run();
     })
@@ -61,7 +64,6 @@ struct SipTask {
     // Networking
     rx_buf: [u8; 1500],
     sip_socket: UdpSocket,
-    rtp_socket: UdpSocket,
     registrar: String,
     local_ip: String,
     local_sip_port: u16,
@@ -77,6 +79,8 @@ struct SipTask {
 impl SipTask {
     fn new(
         settings: &'static crate::settings::Settings,
+        addr: Ipv4Addr,
+        local_rtp_port: u16,
         sip_rx: SipCommandReceiver,
         ui_tx: UiCommandSender,
         audio_tx: AudioCommandSender,
@@ -88,7 +92,7 @@ impl SipTask {
         let registrar = parse_uri(settings.sip_registrar);
 
         // SIP socket
-        let sip_socket = UdpSocket::bind("0.0.0.0:0").expect("create SIP socket");
+        let sip_socket = UdpSocket::bind((addr, 0)).expect("create SIP socket");
         sip_socket
             .set_nonblocking(true)
             .expect("set SIP socket non-blocking");
@@ -98,13 +102,6 @@ impl SipTask {
         }
 
         let (local_ip, local_sip_port) = local_ip_port(&sip_socket);
-
-        // RTP socket
-        let rtp_socket = UdpSocket::bind("0.0.0.0:0").expect("create RTP socket");
-        let local_rtp_port = rtp_socket
-            .local_addr()
-            .map(|addr| addr.port())
-            .unwrap_or(10_000);
 
         Self {
             settings,
@@ -120,7 +117,6 @@ impl SipTask {
 
             rx_buf: [0u8; 1500],
             sip_socket,
-            rtp_socket,
             registrar,
             local_ip,
             local_sip_port,
@@ -366,9 +362,65 @@ impl SipTask {
             }
             CoreDialogEvent::DialogStateChanged(state) => {
                 log::info!("Dialog state -> {}", state);
-                self.broadcast_phone_state();
-                // TODO: maybe RTC/rtp_tx/rtp_rx updates based on Established/Terminated
+                self.on_dialog_state_changed(&state);
             }
+        }
+    }
+
+    fn on_dialog_state_changed(&mut self, state: &sip_core::DialogState) {
+        self.broadcast_phone_state();
+
+        match state {
+            sip_core::DialogState::Established { .. } => {
+                self.start_rtp_streams_from_ctx();
+            }
+            sip_core::DialogState::Terminated | sip_core::DialogState::Idle => {
+                self.stop_rtp_streams();
+                self.call_ctx = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn start_rtp_streams_from_ctx(&mut self) {
+        let ctx = match &self.call_ctx {
+            Some(c) => c,
+            None => {
+                log::warn!("start_rtp_streams_from_ctx: no call context");
+                return;
+            }
+        };
+
+        if ctx.remote_sdp.media.port == 0 {
+            log::info!("remote RTP port is 0 (hold); stopping RTP");
+            self.stop_rtp_streams();
+            return;
+        }
+
+        let mut remote_ip: HString<48> = HString::new();
+        if remote_ip.push_str(ctx.remote_sdp.connection_address.as_str()).is_err() {
+            log::warn!(
+                "start_rtp_streams_from_ctx: remote IP too long: {}",
+                ctx.remote_sdp.connection_address
+            );
+            return;
+        }
+
+        let cmd = RtpRxCommand::StartStream {
+            remote_ip,
+            remote_port: ctx.remote_sdp.media.port,
+            expected_ssrc: None,
+            payload_type: ctx.remote_sdp.media.payload_type,
+        };
+
+        if let Err(e) = self.rtp_rx_tx.send(cmd) {
+            log::warn!("Failed to start RTP RX: {:?}", e);
+        }
+    }
+
+    fn stop_rtp_streams(&mut self) {
+        if let Err(e) = self.rtp_rx_tx.send(RtpRxCommand::StopStream) {
+            log::debug!("stop_rtp_streams: receiver dropped? {:?}", e);
         }
     }
 
@@ -425,6 +477,7 @@ impl SipTask {
                 Ok(sdp) => {
                     if let Some(ctx) = &mut self.call_ctx {
                         ctx.remote_sdp = sdp;
+                        self.start_rtp_streams_from_ctx();
                     }
                 }
                 Err(e) => {
@@ -631,6 +684,7 @@ impl SipTask {
                 Some(_ctx),
             ) => {
                 // TODO: Build BYE, send it, stop RTP...
+                self.stop_rtp_streams();
                 self.core.dialog.terminate_local();
                 self.broadcast_phone_state();
                 self.call_ctx = None;
@@ -688,6 +742,7 @@ impl SipTask {
         let _ = self.send_response_480_temporarily_unavailable(&ctx.invite, ctx.remote_addr);
 
         // Move dialog to Terminated in core
+        self.stop_rtp_streams();
         self.core.dialog.terminate_local();
         self.broadcast_phone_state();
 

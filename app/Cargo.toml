@@ -12,11 +12,12 @@ path = "src/main.rs"
 log.workspace = true
 thiserror.workspace = true
 atom_echo_hw = { path = "../atom_echo_hw" }
-rtp_audio = { path = "../rtp_audio" }
+rtp_audio = { path = "../rtp_audio", features = ["table_decode"]}
 sdp = { path = "../sdp" }
 sip_core = { path = "../sip_core" }
 heapless.workspace = true
 static-toml = "1"
+bytemuck = "1.24.0"
 
 [target.'cfg(not(target_os = "espidf"))'.dependencies]
 env_logger = "0.11"

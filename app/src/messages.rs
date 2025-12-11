@@ -2,6 +2,7 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use atom_echo_hw::{ButtonState, LedState};
 use heapless::{String as HString, Vec as HVec};
+use rtp_audio::RtpPacket;
 
 /// High-level call mode from the perspective of audio:
 /// - Idle: no call
@@ -31,9 +32,21 @@ pub type SipCommandSender = Sender<SipCommand>;
 pub type SipCommandReceiver = Receiver<SipCommand>;
 
 #[derive(Debug)]
+pub enum AudioCodec {
+    Pcmu8k,
+}
+
+#[derive(Debug)]
 pub enum AudioCommand {
     /// High-level mode change: Idle/Listen/Talk
     SetMode(AudioMode),
+
+    StartRtpPlayback {
+        codec: AudioCodec,
+        sample_rate: u32,
+    },
+
+    StopPlayback,
 
     /// Inform audio of call state if it needs to behave differently
     /// (e.g. play ringback tone vs remote audio)
@@ -65,9 +78,11 @@ pub type RtpTxCommandReceiver = Receiver<RtpTxCommand>;
 
 #[derive(Debug)]
 pub enum RtpRxCommand {
-    /// Set the expected SSRC/PT and mark the stream active.
+    /// Configure inbound RTP expectations and mark the stream active.
     StartStream {
-        expected_ssrc: u32,
+        remote_ip: HString<48>,
+        remote_port: u16,
+        expected_ssrc: Option<u32>,
         payload_type: u8,
     },
 
@@ -104,11 +119,14 @@ pub enum MediaOut {
 pub type MediaOutSender = Sender<MediaOut>;
 pub type MediaOutReceiver = Receiver<MediaOut>;
 
+// tune N to max payload (e.g. 160 bytes for PCMU/8000 20ms)
+pub type RxRtpPacket = RtpPacket<512>;
+
 #[derive(Debug)]
 pub enum MediaIn {
     /// An incoming RTP packet that passed SSRC/PT checks.
     /// Audio task will decode, jitter-buffer, and play.
-    EncodedRtpPacket(HVec<u8, 512>),
+    RtpPcmuPacket(RxRtpPacket),
 }
 
 pub type MediaInSender = Sender<MediaIn>;

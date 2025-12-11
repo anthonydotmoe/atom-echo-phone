@@ -1,114 +1,292 @@
 use std::sync::mpsc::TryRecvError;
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use atom_echo_hw::{ButtonState, Device};
-use heapless::{String as HString, Vec as HVec};
-use log::{debug, warn};
-use rtp_audio::{decode_ulaw, JitterBuffer, RtpPacket};
+use atom_echo_hw::AudioDevice;
+use rtp_audio::{decode_ulaw, JitterBuffer};
 
-use crate::messages::{
-    AudioCommand, AudioCommandReceiver, AudioControl, AudioControlReceiver, SipCommand,
-    SipCommandSender, UiCommand, UiCommandSender,
-};
+const FRAME_SAMPLES: usize = 160; // 20ms at 8kHz
+const FRAME_DURATION: Duration = Duration::from_millis(20);
 
-const FRAME_SAMPLES: usize = 160;
+type Jb = JitterBuffer<10, FRAME_SAMPLES>; // 10 frames = 200ms
 
-pub fn spawn_audio_task(
-    device: Arc<Mutex<Device>>,
-    sip_tx: SipCommandSender,
-    audio_rx: AudioCommandReceiver,
-    control_rx: AudioControlReceiver,
-    ui_tx: UiCommandSender,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || audio_loop(device, sip_tx, audio_rx, control_rx, ui_tx))
+use crate::messages::{AudioCodec, AudioCommand, AudioCommandReceiver, MediaIn, MediaInReceiver, PhoneState, RxRtpPacket};
+
+enum TxState {
+    Stopped,
+    Ready,
+    Running,
 }
 
-fn audio_loop(
-    device: Arc<Mutex<Device>>,
-    sip_tx: SipCommandSender,
-    audio_rx: AudioCommandReceiver,
-    control_rx: AudioControlReceiver,
-    ui_tx: UiCommandSender,
-) {
-    let mut jitter: JitterBuffer<8, FRAME_SAMPLES> = JitterBuffer::new();
-    let mut remote_rtp: Option<(HString<48>, u16)> = None;
-    let mut ptt_pressed = false;
+pub fn spawn_audio_task(
+    cmd_rx: AudioCommandReceiver,
+    audio_device: AudioDevice,
+    media_rx: MediaInReceiver,
+) -> thread::JoinHandle<()> {
+    thread::Builder::new()
+        .name("audio".into())
+        .spawn(move || {
+            let mut task = AudioTask::new(cmd_rx, audio_device, media_rx);
+            task.run();
+        })
+        .expect("failed to spawn audio task")
+}
 
-    loop {
-        // Handle messages from SIP.
+struct AudioTask {
+    cmd_rx: AudioCommandReceiver,
+    audio_device: AudioDevice,
+    media_rx: MediaInReceiver,
+    playing: bool,
+    tx_state: TxState,
+
+    jitter: Jb,
+    next_playout_deadline: Option<std::time::Instant>,
+}
+
+impl AudioTask {
+    fn new(
+        cmd_rx: AudioCommandReceiver,
+        audio_device: AudioDevice,
+        media_rx: MediaInReceiver,
+    ) -> Self {
+        Self {
+            cmd_rx,
+            audio_device,
+            media_rx,
+            playing: false,
+            tx_state: TxState::Ready,
+            jitter: Jb::new(),
+            next_playout_deadline: None,
+        }
+    }
+
+    fn run(&mut self) {
+        let _ = self.audio_device.tx_disable();
         loop {
-            match audio_rx.try_recv() {
-                Ok(cmd) => match cmd {
-                    AudioCommand::DialogStateChanged(state) => {
-                        debug!("audio_task: dialog state {:?}", state);
-                        let _ = ui_tx.send(UiCommand::DialogStateChanged(state));
+            if !self.poll_commands() {
+                break;
+            }
+
+            self.poll_media();
+
+            if self.playing {
+                self.maybe_feed_i2s();
+            }
+
+            thread::sleep(Duration::from_millis(8));
+        }
+
+        self.stop_tx()
+    }
+
+    fn maybe_feed_i2s(&mut self) {
+        use std::time::Instant;
+
+        let now = Instant::now();
+
+        // Initialize playout schedule once we know we should start
+        if self.next_playout_deadline.is_none() {
+            // small initial buffering delay (one frame)
+            self.next_playout_deadline = Some(now + FRAME_DURATION);
+            return;
+        }
+
+        let deadline = self.next_playout_deadline.unwrap();
+
+        if now < deadline {
+            // Not time yet, come back later
+            return;
+        }
+
+        // We might have slipped a bit; schedule the *next* playout before doing work
+        self.next_playout_deadline = Some(deadline + FRAME_DURATION);
+
+        // Now pop exactly one frame from jitter and feed I2S
+        self.feed_i2s();
+    }
+
+    fn poll_commands(&mut self) -> bool {
+        loop {
+            match self.cmd_rx.try_recv() {
+                Ok(cmd) => self.handle_command(cmd),
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => return false,
+            }
+        }
+    }
+
+    fn handle_command(&mut self, cmd: AudioCommand) {
+        match cmd {
+            AudioCommand::StartRtpPlayback { codec, sample_rate } => {
+                // configure I2S for TX at given sample_rate if needed
+                log::info!("audio: start playback {:?} @ {} Hz", codec, sample_rate);
+                self.start_tx();
+                self.playing = true;
+            }
+            AudioCommand::StopPlayback => {
+                log::info!("audio: stop playback");
+                self.playing = false;
+                self.stop_tx();
+                self.jitter = Jb::new();
+                // Mute I2S / stop TX
+            }
+            AudioCommand::SetDialogState(p) => {
+                self.handle_dialog_state(p);
+            }
+            other_cmd => {
+                log::warn!("audio: unhandled command: {:?}", other_cmd);
+            }
+        }
+    }
+
+    fn handle_dialog_state(&mut self, phone_state: PhoneState) {
+        match phone_state {
+            PhoneState::Idle => {
+                //log::info!("Jb:\r\n{:#?}", self.jitter);
+                self.handle_command(AudioCommand::StopPlayback);
+            }
+            PhoneState::Ringing => {
+                self.handle_command(AudioCommand::StopPlayback);
+            }
+            PhoneState::Established => {
+                self.handle_command(AudioCommand::StartRtpPlayback { codec: AudioCodec::Pcmu8k, sample_rate: 8000 });
+            }
+        }
+    }
+
+    fn poll_media(&mut self) {
+        loop {
+            match self.media_rx.try_recv() {
+                Ok(MediaIn::RtpPcmuPacket(pkt)) => {
+                    if !self.playing {
+                        continue;
                     }
-                    AudioCommand::SetRemoteRtpEndpoint { ip, port } => {
-                        debug!("audio_task: remote RTP {}:{}", ip, port);
-                        remote_rtp = Some((ip, port));
-                    }
-                    AudioCommand::IncomingRtpPacket(bytes) => {
-                        if let Ok(pkt) = RtpPacket::<512>::unpack(&bytes) {
-                            let decoded = decode_ulaw(&pkt.payload);
-                            jitter.push_frame(pkt.header.sequence_number, &decoded);
-                        } else {
-                            warn!("audio_task: failed to unpack RTP");
-                        }
-                    }
-                    AudioCommand::SetLed(state) => {
-                        let _ = ui_tx.send(UiCommand::SetLed(state));
-                    }
-                },
-                Err(TryRecvError::Empty) => break,
+                    self.handle_rtp_pcmu(pkt);
+                }
+                Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
-                    warn!("audio_task: audio channel closed; exiting");
+                    log::info!("audio: media_rx disconnected");
                     return;
                 }
             }
         }
+    }
 
-        // Button state from UI for PTT capture gating.
-        loop {
-            match control_rx.try_recv() {
-                Ok(AudioControl::ButtonState(state)) => {
-                    ptt_pressed = state == ButtonState::Pressed;
+    fn handle_rtp_pcmu(&mut self, pkt: RxRtpPacket) {
+        // PCMU payload is μ-law bytes
+        let decoded: heapless::Vec<i16, 512> = decode_ulaw(&pkt.payload);
+
+        // Push into jitter buffer based on sequence number
+        self.jitter
+            .push_frame(pkt.header.sequence_number, &decoded);
+    }
+
+    fn feed_i2s(&mut self) {
+        if !matches!(self.tx_state, TxState::Running) {
+            return;
+        }
+
+        // One frame = 20ms
+        let (frame, had_real) = self.jitter.pop_frame();
+        log::debug!(
+            "playout frame, real={}, first_sample={}",
+            had_real,
+            frame.get(0).copied().unwrap_or(0)
+        );
+        // frame is filled with samples or silence
+
+        // Interleave to stereo
+        let mut stereo = [0i16; FRAME_SAMPLES * 2];
+        for (i, s) in frame.iter().enumerate() {
+            stereo[2 * i] = *s;
+            stereo[2 * i + 1] = *s;
+        }
+        let bytes: &[u8] = bytemuck::cast_slice(&stereo);
+
+        self.write_all(bytes);
+    }
+
+    fn write_all(&mut self, mut data: &[u8]) {
+        while !data.is_empty() {
+            // Short timeout to not block the thread forever if DMA is full
+            match self.audio_device.write(data, Duration::from_millis(4)) {
+                Ok(0) => {
+                    // TX buffer full, try again later.
+                    log::info!("F");
+                    break;
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
+                Ok(n) => {
+                    log::debug!("n{}", n);
+                    data = &data[n..];
+                }
+                Err(e) => {
+                    log::warn!("write failed: {:?}", e);
+                    break;
+                }
             }
         }
+    }
 
-        // Playback path: drain jitter buffer (silence if empty).
-        let (frame, _had_audio) = jitter.pop_frame();
-        if let Ok(mut dev) = device.lock() {
-            let _ = dev.write_speaker_frame(&frame);
+    fn start_tx(&mut self) {
+        // Try to get back to READY no matter what previous state was.
+        match self.tx_state {
+            TxState::Running => {
+                let _ = self.audio_device.tx_disable();
+                self.tx_state = TxState::Stopped;
+            }
+            _ => {}
         }
 
-        // Capture path: only when PTT is pressed and we have a remote endpoint.
-        if ptt_pressed {
-            if let Some((_, _port)) = remote_rtp.as_ref() {
-                let mut mic_buf = [0_i16; FRAME_SAMPLES];
-                if let Ok(mut dev) = device.lock() {
-                    match dev.read_mic_frame(&mut mic_buf) {
-                        Ok(count) => {
-                            let mut vec: HVec<i16, FRAME_SAMPLES> = HVec::new();
-                            for sample in mic_buf.iter().copied().take(count) {
-                                let _ = vec.push(sample);
-                            }
-                            if sip_tx.send(SipCommand::OutgoingPcmFrame(vec)).is_err() {
-                                warn!("audio_task: failed to send PCM frame to SIP");
-                            }
-                        }
-                        Err(err) => {
-                            warn!("audio_task: mic read error: {:?}", err);
-                        }
+        // At this point the underlying channel should be READY
+        // or at least in a state where preload is allowed.
+        self.tx_state = TxState::Ready;
+
+        // Prime DMA with a few silence frames so when we enable, the line is clean
+        self.prime_dma_with_silence(3);
+
+        // Now enable TX
+        if let Err(e) = self.audio_device.tx_enable() {
+            log::warn!("audio: tx_enable failed: {:?}", e);
+            // bail out; leave state as Ready so another Start might try again.
+            return;
+        }
+        self.tx_state = TxState::Running;
+    }
+
+    fn stop_tx(&mut self) {
+        if let TxState::Running = self.tx_state {
+            if let Err(e) = self.audio_device.tx_disable() {
+                log::warn!("audio: tx_disable failed: {:?}", e);
+            }
+        }
+        self.tx_state = TxState::Stopped;
+    }
+
+    fn prime_dma_with_silence(&mut self, frames: usize) {
+        let bytes: &[u8] = bytemuck::cast_slice(&SILENCE_FRAME);
+
+        for _ in 0..frames {
+            if let TxState::Ready = self.tx_state {
+                match self.audio_device.preload_data(bytes) {
+                    Ok(written) if written == bytes.len() => {}
+                    Ok(written) => {
+                        log::debug!(
+                            "audio: preload buffer full after {} bytes (wanted {})",
+                            written,
+                            bytes.len()
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        log::warn!("audio: preload_data failed: {:?}", e);
+                        break;
                     }
                 }
+            } else {
+                break;
             }
         }
-
-        thread::sleep(Duration::from_millis(10));
     }
 }
+
+static SILENCE_FRAME: [i16; FRAME_SAMPLES * 2] = [0i16; FRAME_SAMPLES * 2];

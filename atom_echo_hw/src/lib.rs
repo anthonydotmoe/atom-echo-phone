@@ -6,6 +6,8 @@
 
 #![cfg_attr(not(target_os = "espidf"), allow(unused))]
 
+use std::net::Ipv4Addr;
+
 use heapless::String;
 
 pub use crate::imp::{AudioDevice, UiDevice};
@@ -99,6 +101,10 @@ impl Device {
 
     pub fn get_ui_device(&mut self) -> Result<UiDevice, HardwareError> {
         self.inner.get_ui_device()
+    }
+
+    pub fn get_ip_addr(&self) -> Ipv4Addr {
+        self.inner.get_ip_addr()
     }
 }
 
