@@ -2,8 +2,10 @@ use super::{ButtonState, HardwareError, LedState, WifiConfig};
 
 #[cfg(target_os = "espidf")]
 mod esp {
+    use std::net::Ipv4Addr;
     use std::time::Duration;
 
+    use esp_idf_hal::delay::TickType;
     use esp_idf_svc::sys as esp_idf_sys;
     use esp_idf_sys::{
         esp_eap_client_set_password, esp_eap_client_set_username,
@@ -29,6 +31,7 @@ mod esp {
     /// are implemented.
     pub struct DeviceInner {
         wifi: EspWifi<'static>,
+        addr: Ipv4Addr,
         ui_device: Option<UiDevice>,
         audio_device: Option<AudioDevice>,
     }
@@ -158,6 +161,7 @@ mod esp {
 
         Ok(DeviceInner {
             wifi,
+            addr: ip,
             ui_device: Some(UiDevice { led, button }),
             audio_device: Some(AudioDevice { speaker: speaker, /* mic: mic */ })
         })
@@ -179,25 +183,70 @@ mod esp {
 
             Ok(self.ui_device.take().unwrap())
         }
+
     }
 
     impl AudioDevice {
-        pub fn read_mic_frame(&mut self, buf: &mut [i16]) -> Result<usize, HardwareError> {
-            // TODO: implement real I2S read
-            //
-            // For now, just fill with silence so the rest of the stack
-            // can be exercised without audio hardware wired up.
-            buf.fill(0);
-            Ok(buf.len())
+        /// Disable the I2S transmit channel.
+        ///
+        /// # Note
+        /// This can only be called when the channel is in the `RUNNING` state: the channel has been previously enabled
+        /// via a call to [`tx_enable()`][I2sTxChannel::tx_enable]. The channel will enter the `READY` state if it is disabled
+        /// successfully.
+        ///
+        /// Disabling the channel will stop I2S communications on the hardware. BCLK and WS signals will stop being
+        /// generated if this is a controller. MCLK will continue to be generated.
+        ///
+        /// # Errors
+        /// This will return an [`EspError`] with `ESP_ERR_INVALID_STATE` if the channel is not in the `RUNNING` state.
+        pub fn tx_disable(&mut self) -> Result<(), HardwareError> {
+            self.speaker.tx_disable().map_err(map_audio_err)
         }
 
-        pub fn write_speaker_frame(&mut self, buf: &[i16]) -> Result<usize, HardwareError> {
-            // TODO: implement real I2S write
-            let _ = &self.speaker; // keep field "used" for now
-            let _ = buf;
-            Ok(buf.len())
+        /// Enable the I2S transmit channel.
+        ///
+        /// # Note
+        /// This can only be called when the channel is in the `READY` state: initialized but not yet started from a driver
+        /// constructor, or disabled from the `RUNNING` state via [`tx_disable()`][I2sTxChannel::tx_disable]. The channel
+        /// will enter the `RUNNING` state if it is enabled successfully.
+        ///
+        /// Enabling the channel will start I2S communications on the hardware. BCLK and WS signals will be generated if
+        /// this is a controller. MCLK will be generated once initialization is finished.
+        ///
+        /// # Errors
+        /// This will return an [`EspError`] with `ESP_ERR_INVALID_STATE` if the channel is not in the `READY` state.
+        pub fn tx_enable(&mut self) -> Result<(), HardwareError> {
+            self.speaker.tx_enable().map_err(map_audio_err)
         }
 
+        /// Preload data into the transmit channel DMA buffer.
+        ///
+        /// This may be called only when the channel is in the `READY` state: initialized but not yet started.
+        ///
+        /// This is used to preload data into the DMA buffer so that valid data can be transmitted immediately after the
+        /// channel is enabled via [`tx_enable()`][I2sTxChannel::tx_enable]. If this function is not called before enabling the channel,
+        /// empty data will be transmitted.
+        ///
+        /// This function can be called multiple times before enabling the channel. Additional calls will concatenate the
+        /// data to the end of the buffer until the buffer is full.
+        ///
+        /// # Returns
+        /// This returns the number of bytes that have been loaded into the buffer. If this is less than the length of
+        /// the data provided, the buffer is full and no more data can be loaded.
+        pub fn preload_data(&mut self, data: &[u8]) -> Result<usize, HardwareError> {
+            self.speaker.preload_data(data).map_err(map_audio_err)
+        }
+
+        /// Write data to the channel.
+        ///
+        /// This may be called only when the channel is in the `RUNNING` state.
+        ///
+        /// # Returns
+        /// This returns the number of bytes sent. This may be less than the length of the data provided.
+        pub fn write(&mut self, data: &[u8], timeout: Duration) -> Result<usize, HardwareError> {
+            let tick_timeout = TickType::from(timeout);
+            self.speaker.write(data, tick_timeout.into()).map_err(map_audio_err)
+        }
     }
 
     impl UiDevice {
@@ -365,13 +414,30 @@ mod esp {
 mod host {
     use super::*;
     use log::debug;
+    use std::time::Duration;
 
     /// Host-side fake device handle for unit tests / desktop builds.
     #[derive(Debug, Default)]
     pub struct DeviceInner;
 
-    #[derive(Debug, Default)]
-    pub struct AudioDevice;
+    #[derive(Debug)]
+    pub struct AudioDevice {
+        buf: Vec<u8>,
+        sample_rate: u32,
+        channels: u16,
+        bits_per_sample: u16,
+    }
+
+    impl Default for AudioDevice {
+        fn default() -> Self {
+            Self {
+                buf: Vec::new(),
+                sample_rate: 8_000,
+                channels: 2,
+                bits_per_sample: 16,
+            }
+        }
+    }
 
     #[derive(Debug, Default)]
     pub struct UiDevice;
@@ -386,7 +452,7 @@ mod host {
 
     impl DeviceInner {
         pub fn get_audio_device(&mut self) -> Result<AudioDevice, HardwareError> {
-            Ok(AudioDevice {})
+            Ok(AudioDevice::default())
         }
 
         pub fn get_ui_device(&mut self) -> Result<UiDevice, HardwareError> {
@@ -395,15 +461,50 @@ mod host {
     }
     
     impl AudioDevice {
-        pub fn read_mic_frame(&mut self, buf: &mut [i16]) -> Result<usize, HardwareError> {
-            // host: just zero-fill
-            buf.fill(0);
-            Ok(buf.len())
-        }
+        fn dump_wav_to_path<P: AsRef<std::path::Path>>(
+            &self,
+            path: P,
+        ) -> std::io::Result<()> {
+            use std::fs::File;
+            use std::io::Write;
 
-        pub fn write_speaker_frame(&mut self, buf: &[i16]) -> Result<usize, HardwareError> {
-            debug!("simulated speaker write: {} samples", buf.len());
-            Ok(buf.len())
+            if self.buf.is_empty() {
+                return Ok(())
+            }
+
+            let sample_rate = self.sample_rate;
+            let channels = self.channels;
+            let bits_per_sample = self.bits_per_sample;
+
+            let byte_rate =
+                sample_rate * channels as u32 * (bits_per_sample as u32 / 8);
+            let block_align = channels * bits_per_sample / 8;
+            let subchunk2_size = self.buf.len() as u32;
+            let chunk_size = 4 + (8 + 16) + (8 + subchunk2_size);
+
+            let mut f = File::create(path)?;
+
+            // RIFF header
+            f.write_all(b"RIFF")?;
+            f.write_all(&chunk_size.to_le_bytes())?;
+            f.write_all(b"WAVE")?;
+
+            // fmt chunk
+            f.write_all(b"fmt ")?;
+            f.write_all(&16u32.to_le_bytes())?;          // Subchunk1Size
+            f.write_all(&1u16.to_le_bytes())?;           // AudioFormat = PCM
+            f.write_all(&channels.to_le_bytes())?;
+            f.write_all(&sample_rate.to_le_bytes())?;
+            f.write_all(&byte_rate.to_le_bytes())?;
+            f.write_all(&block_align.to_le_bytes())?;
+            f.write_all(&bits_per_sample.to_le_bytes())?;
+
+            // data chunk
+            f.write_all(b"data")?;
+            f.write_all(&subchunk2_size.to_le_bytes())?;
+            f.write_all(&self.buf)?;
+
+            Ok(())
         }
     }
 
@@ -415,6 +516,41 @@ mod host {
         pub fn set_led_state(&mut self, state: LedState) -> Result<(), HardwareError> {
             debug!("simulated LED state: {:?}", state);
             Ok(())
+        }
+    }
+
+    impl AudioDevice {
+        /// Disable the I2S transmit channel.
+        pub fn tx_disable(&mut self) -> Result<(), HardwareError> {
+            let path = format!("audio_{:#08x}.wav", random_u32());
+            if let Err(e) = self.dump_wav_to_path(&path) {
+                eprintln!("failed to write {}: {}", &path, e);
+            } else {
+                eprintln!(
+                    "write {} ({} bytes of audio)",
+                    &path,
+                    self.buf.len()
+                );
+            }
+            
+            Ok(())
+        }
+
+        /// Enable the I2S transmit channel.
+        pub fn tx_enable(&mut self) -> Result<(), HardwareError> {
+            Ok(())
+        }
+
+        /// Preload data into the transmit channel DMA buffer.
+        pub fn preload_data(&mut self, data: &[u8]) -> Result<usize, HardwareError> {
+            self.buf.extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        /// Write data to the channel.
+        pub fn write(&mut self, data: &[u8], timeout: Duration) -> Result<usize, HardwareError> {
+            self.buf.extend_from_slice(data);
+            Ok(data.len())
         }
     }
 
