@@ -218,6 +218,11 @@ impl<const CAP: usize, const FRAME: usize> JitterBuffer<CAP, FRAME> {
         }
     }
 
+    pub fn reset(&mut self) {
+        self.next_seq = None;
+        self.frames.clear();
+    }
+
     pub fn push_frame(&mut self, seq: u16, samples: &[i16]) {
         if self.frames.is_full() {
             let _ = self.frames.remove(0);

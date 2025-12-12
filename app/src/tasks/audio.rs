@@ -61,7 +61,6 @@ impl AudioTask {
     }
 
     fn run(&mut self) {
-        let _ = self.audio_device.tx_disable();
         loop {
             if !self.poll_commands() {
                 break;
@@ -120,14 +119,18 @@ impl AudioTask {
             AudioCommand::StartRtpPlayback { codec, sample_rate } => {
                 // configure I2S for TX at given sample_rate if needed
                 log::info!("audio: start playback {:?} @ {} Hz", codec, sample_rate);
+                // Reset playout scheduling so a new call does not reuse an old deadline.
+                self.next_playout_deadline = None;
+                self.jitter.reset();
                 self.start_tx();
                 self.playing = true;
             }
             AudioCommand::StopPlayback => {
                 log::info!("audio: stop playback");
                 self.playing = false;
+                self.next_playout_deadline = None;
                 self.stop_tx();
-                self.jitter = Jb::new();
+                self.jitter.reset();
                 // Mute I2S / stop TX
             }
             AudioCommand::SetDialogState(p) => {
