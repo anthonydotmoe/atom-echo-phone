@@ -4,13 +4,20 @@ use std::time::Duration;
 
 use atom_echo_hw::AudioDevice;
 use rtp_audio::{decode_ulaw, JitterBuffer};
+use crate::{
+    messages::{
+        AudioCodec, AudioCommand, AudioCommandReceiver,
+        MediaIn, MediaInReceiver, PhoneState, RxRtpPacket
+    },
+    tasks::task::{AppTask, TaskMeta}
+};
+
+static SILENCE_FRAME: [i16; FRAME_SAMPLES * 2] = [0i16; FRAME_SAMPLES * 2];
 
 const FRAME_SAMPLES: usize = 160; // 20ms at 8kHz
 const FRAME_DURATION: Duration = Duration::from_millis(20);
 
 type Jb = JitterBuffer<10, FRAME_SAMPLES>; // 10 frames = 200ms
-
-use crate::messages::{AudioCodec, AudioCommand, AudioCommandReceiver, MediaIn, MediaInReceiver, PhoneState, RxRtpPacket};
 
 enum TxState {
     Stopped,
@@ -18,21 +25,7 @@ enum TxState {
     Running,
 }
 
-pub fn spawn_audio_task(
-    cmd_rx: AudioCommandReceiver,
-    audio_device: AudioDevice,
-    media_rx: MediaInReceiver,
-) -> thread::JoinHandle<()> {
-    thread::Builder::new()
-        .name("audio".into())
-        .spawn(move || {
-            let mut task = AudioTask::new(cmd_rx, audio_device, media_rx);
-            task.run();
-        })
-        .expect("failed to spawn audio task")
-}
-
-struct AudioTask {
+pub struct AudioTask {
     cmd_rx: AudioCommandReceiver,
     audio_device: AudioDevice,
     media_rx: MediaInReceiver,
@@ -43,8 +36,23 @@ struct AudioTask {
     next_playout_deadline: Option<std::time::Instant>,
 }
 
+impl AppTask for AudioTask {
+    fn into_runner(mut self: Box<Self>) -> Box<dyn FnOnce() + Send + 'static> {
+        Box::new(move || {
+            self.run()
+        })
+    }
+
+    fn meta(&self) -> TaskMeta {
+        TaskMeta {
+            name: "audio",
+            stack_bytes: None,
+        }
+    }
+}
+
 impl AudioTask {
-    fn new(
+    pub fn new(
         cmd_rx: AudioCommandReceiver,
         audio_device: AudioDevice,
         media_rx: MediaInReceiver,
@@ -292,4 +300,49 @@ impl AudioTask {
     }
 }
 
-static SILENCE_FRAME: [i16; FRAME_SAMPLES * 2] = [0i16; FRAME_SAMPLES * 2];
+pub fn audio_test(mut audio: AudioDevice) -> ! {
+    use std::f32::consts::PI;
+    audio.tx_enable().unwrap();
+
+    let mut frame_count = 100;
+
+    const SR: u32 = 48_000;
+    const FRAME: usize = 160; // 20 ms
+    const F_TONE: f32 = 447.0;
+
+    let mut phase: f32 = 0.0;
+    let step = 2.0 * PI * F_TONE / SR as f32;
+
+    loop {
+        let mut frame_mono = [0i16; FRAME];
+        for s in &mut frame_mono {
+            *s = (phase.sin() * 8000.0) as i16;
+            phase += step;
+            if phase > 2.0 * PI {
+                phase -= 2.0 * PI;
+            }
+        }
+
+        // Duplicate to stereo
+        let mut stereo = [0i16; FRAME * 2];
+        for (i, &s) in frame_mono.iter().enumerate() {
+            let idx = i * 2;
+            stereo[idx] = s;
+            stereo[idx + 1] = s;
+        }
+
+        let bytes: &[u8] = bytemuck::cast_slice(&stereo);
+        let _ = audio.write(bytes, Duration::from_millis(50)).unwrap();
+        //frame_count -= 1;
+
+        if frame_count == 0 {
+            break;
+        }
+    }
+
+    audio.tx_disable();
+    log::debug!("DONE");
+
+    loop {}
+}
+

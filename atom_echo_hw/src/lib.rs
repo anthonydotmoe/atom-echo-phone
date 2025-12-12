@@ -6,7 +6,7 @@
 
 #![cfg_attr(not(target_os = "espidf"), allow(unused))]
 
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 
 use heapless::String;
 
@@ -103,7 +103,7 @@ impl Device {
         self.inner.get_ui_device()
     }
 
-    pub fn get_ip_addr(&self) -> Ipv4Addr {
+    pub fn get_ip_addr(&self) -> IpAddr {
         self.inner.get_ip_addr()
     }
 }

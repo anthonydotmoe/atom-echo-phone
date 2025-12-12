@@ -7,27 +7,11 @@ use std::time::Duration;
 use rtp_audio::RtpPacket;
 
 use crate::messages::{MediaIn, MediaInSender, RtpRxCommand, RtpRxCommandReceiver};
+use crate::tasks::task::{AppTask, TaskMeta};
 
 const RX_BUF_SIZE: usize = 1500;
 
-/// Spawn the RTP RX task. Owns the UDP socket bound to our advertised RTP port,
-/// listens for inbound RTP, filters on SSRC/payload type/remote addr, and
-/// forwards accepted packets to the audio pipeline as `MediaIn::EncodedRtpPacket`.
-pub fn spawn_rtp_rx_task(
-    socket: UdpSocket,
-    cmd_rx: RtpRxCommandReceiver,
-    media_tx: MediaInSender,
-) -> thread::JoinHandle<()> {
-    thread::Builder::new()
-        .name("rtp-rx".into())
-        .spawn(move || {
-            let mut task = RtpRxTask::new(socket, cmd_rx, media_tx);
-            task.run();
-        })
-        .expect("failed to spawn RTP RX task")
-}
-
-struct RtpRxTask {
+pub struct RtpRxTask {
     socket: UdpSocket,
     cmd_rx: RtpRxCommandReceiver,
     media_tx: MediaInSender,
@@ -38,9 +22,24 @@ struct RtpRxTask {
     payload_type: Option<u8>,
     remote_addr: Option<SocketAddr>,
 }
+    
+impl AppTask for RtpRxTask {
+    fn into_runner(mut self: Box<Self>) -> Box<dyn FnOnce() + Send + 'static> {
+        Box::new(move || {
+            self.run();
+        })
+    }
+
+    fn meta(&self) -> TaskMeta {
+        TaskMeta {
+            name: "rtp_rx",
+            stack_bytes: None,
+        }
+    }
+}
 
 impl RtpRxTask {
-    fn new(
+    pub fn new(
         socket: UdpSocket,
         cmd_rx: RtpRxCommandReceiver,
         media_tx: MediaInSender,

@@ -1,5 +1,5 @@
 use std::io::ErrorKind::WouldBlock;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -9,34 +9,13 @@ use sip_core::{
     CoreDialogEvent, CoreEvent, CoreRegistrationEvent, DigestCredentials, InviteKind, RegistrationResult, RegistrationState, SipStack, authorization_header, header_value
 };
 
+use crate::tasks::task::{AppTask, TaskMeta};
 use crate::messages::{
     self,
     AudioCommand, AudioCommandSender, ButtonEvent, PhoneState,
     RtpRxCommand, RtpRxCommandSender, RtpTxCommand, RtpTxCommandSender,
     SipCommand, SipCommandReceiver, UiCommand, UiCommandSender
 };
-
-pub fn spawn_sip_task(
-    settings: &'static crate::settings::Settings,
-    addr: Ipv4Addr,
-    local_rtp_port: u16,
-    sip_rx: SipCommandReceiver,
-    ui_tx: UiCommandSender,
-    audio_tx: AudioCommandSender,
-    rtp_tx_tx: RtpTxCommandSender,
-    rtp_rx_tx: RtpRxCommandSender,
-) -> thread::JoinHandle<()> {
-    thread::Builder::new()
-        //.stack_size(STACK_SIZE)
-        .name("sip".into())
-        .spawn(move || {
-            let mut task = Box::new(
-                SipTask::new(settings, addr, local_rtp_port, sip_rx, ui_tx, audio_tx, rtp_tx_tx, rtp_rx_tx)
-            );
-            task.run();
-    })
-    .expect("failed to spawn SIP task")
-}
 
 #[derive(Debug)]
 struct CallContext {
@@ -47,7 +26,7 @@ struct CallContext {
     remote_addr: SocketAddr,
 }
 
-struct SipTask {
+pub struct SipTask {
     // App wiring
     settings: &'static crate::settings::Settings,
     sip_rx: SipCommandReceiver,
@@ -76,10 +55,25 @@ struct SipTask {
     last_reg_state: RegistrationState,
 }
 
+impl AppTask for SipTask {
+    fn into_runner(mut self: Box<Self>) -> Box<dyn FnOnce() + Send + 'static> {
+        Box::new(move || {
+            self.run()
+        })
+    }
+
+    fn meta(&self) -> TaskMeta {
+        TaskMeta {
+            name: "sip",
+            stack_bytes: None,
+        }
+    }
+}
+
 impl SipTask {
-    fn new(
+    pub fn new(
         settings: &'static crate::settings::Settings,
-        addr: Ipv4Addr,
+        addr: IpAddr,
         local_rtp_port: u16,
         sip_rx: SipCommandReceiver,
         ui_tx: UiCommandSender,

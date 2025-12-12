@@ -8,23 +8,9 @@ use crate::messages::{
     PhoneState, SipCommand, SipCommandSender, UiCommand, UiCommandReceiver
 };
 
-pub fn spawn_ui_task(
-    device: UiDevice,
-    ui_rx: UiCommandReceiver,
-    sip_tx: SipCommandSender,
-) -> thread::JoinHandle<()> {
-    thread::Builder::new()
-        .name("ui".into())
-        .spawn(move || {
-            let mut task = Box::new(
-                UiTask::new(device, ui_rx, sip_tx)
-            );
-            task.run();
-        })
-        .expect("failed to spawn UI task")
-}
+use crate::tasks::task::{AppTask, TaskMeta};
 
-struct UiTask {
+pub struct UiTask {
     ui_device: UiDevice,
     ui_rx: UiCommandReceiver,
     sip_tx: SipCommandSender,
@@ -32,8 +18,24 @@ struct UiTask {
     auto_answer_deadline: Option<Instant>,
 }
 
+impl AppTask for UiTask {
+    fn into_runner(mut self: Box<Self>) -> Box<dyn FnOnce() + Send + 'static> {
+
+        Box::new(move || {
+            self.run();
+        })
+    }
+
+    fn meta(&self) -> TaskMeta {
+        TaskMeta {
+            name: "ui",
+            stack_bytes: None,
+        }
+    }
+}
+
 impl UiTask {
-    fn new(
+    pub fn new(
         ui_device: UiDevice,
         ui_rx: UiCommandReceiver,
         sip_tx: SipCommandSender,
@@ -163,64 +165,3 @@ impl UiTask {
     }
 
 }
-
-/*
-fn ui_loop(
-    device: Arc<Mutex<Device>>,
-    ui_rx: UiCommandReceiver,
-    sip_tx: SipCommandSender,
-) {
-    let mut last_button = read_button_state(&device);
-
-    loop {
-        // Handle UI commands (LED updates, dialog changes).
-        loop {
-            match ui_rx.try_recv() {
-                Ok(cmd) => match cmd {
-                    UiCommand::DialogStateChanged(state) => {
-                        handle_dialog_state_changed(state);
-                    }
-                    UiCommand::SetLed(state) => {
-                        log::debug!("ui_task: LED override {:?}", state);
-                        set_led(&device, state);
-                    }
-                },
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    warn!("ui_task: UI channel closed; exiting");
-                    return;
-                }
-            }
-        }
-
-        // Poll button for edge detection.
-        let btn = read_button_state(&device);
-        if btn != last_button {
-            last_button = btn;
-            let event = match btn {
-                ButtonState::Pressed => SipCommand::PttPressed,
-                ButtonState::Released => SipCommand::PttReleased,
-            };
-            log::debug!("ui_task: button {:?} -> {:?}", btn, event);
-            let _ = sip_tx.send(event);
-            let _ = audio_ctrl_tx.send(AudioControl::ButtonState(btn));
-        }
-
-        thread::sleep(Duration::from_millis(10));
-    }
-    
-}
-
-fn read_button_state(device: &Arc<Mutex<Device>>) -> ButtonState {
-    device
-        .lock()
-        .map(|d| d.read_button_state())
-        .unwrap_or(ButtonState::Released)
-}
-
-fn set_led(device: &Arc<Mutex<Device>>, state: LedState) {
-    if let Ok(mut dev) = device.lock() {
-        let _ = dev.set_led_state(state);
-    }
-}
-*/

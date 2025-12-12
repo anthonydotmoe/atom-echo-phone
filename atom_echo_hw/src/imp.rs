@@ -2,7 +2,7 @@ use super::{ButtonState, HardwareError, LedState, WifiConfig};
 
 #[cfg(target_os = "espidf")]
 mod esp {
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
 
     use esp_idf_hal::delay::TickType;
@@ -184,8 +184,8 @@ mod esp {
             Ok(self.ui_device.take().unwrap())
         }
 
-        pub fn get_ip_addr(&self) -> Ipv4Addr {
-            return self.addr
+        pub fn get_ip_addr(&self) -> IpAddr {
+            return IpAddr::V4(self.addr)
         }
 
     }
@@ -418,11 +418,13 @@ mod esp {
 mod host {
     use super::*;
     use log::debug;
-    use std::time::Duration;
+    use std::{net::{IpAddr, UdpSocket}, time::Duration};
 
     /// Host-side fake device handle for unit tests / desktop builds.
-    #[derive(Debug, Default)]
-    pub struct DeviceInner;
+    #[derive(Debug)]
+    pub struct DeviceInner {
+        addr: IpAddr,
+    }
 
     #[derive(Debug)]
     pub struct AudioDevice {
@@ -451,7 +453,11 @@ mod host {
             "simulated Atom Echo init: ssid='{}'",
             config.ssid
         );
-        Ok(DeviceInner)
+
+        // Create a socket to get ip addr
+        let sock = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let addr = sock.local_addr().unwrap().ip();
+        Ok(DeviceInner { addr })
     }
 
     impl DeviceInner {
@@ -461,6 +467,10 @@ mod host {
 
         pub fn get_ui_device(&mut self) -> Result<UiDevice, HardwareError> {
             Ok(UiDevice)
+        }
+
+        pub fn get_ip_addr(&self) -> IpAddr {
+            return self.addr;
         }
     }
     
