@@ -9,6 +9,7 @@ pub enum Method {
     Ack,
     Bye,
     Cancel,
+    Options,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +158,7 @@ impl core::fmt::Display for Method {
             Method::Ack => write!(f, "ACK"),
             Method::Bye => write!(f, "BYE"),
             Method::Cancel => write!(f, "CANCEL"),
+            Method::Options => write!(f, "OPTIONS"),
         }
     }
 }
@@ -259,6 +261,7 @@ fn parse_method(input: &str) -> Result<Method> {
         "ACK" => Ok(Method::Ack),
         "BYE" => Ok(Method::Bye),
         "CANCEL" => Ok(Method::Cancel),
+        "OPTIONS" => Ok(Method::Options),
         _ => Err(SipError::Invalid("unknown method")),
     }
 }
@@ -294,6 +297,16 @@ mod tests {
         let message = parse_message(raw).unwrap();
         match message {
             Message::Request(r) => assert_eq!(r.method, Method::Invite),
+            _ => panic!("expected request"),
+        }
+    }
+
+    #[test]
+    fn parses_options_request() {
+        let raw = "OPTIONS sip:ping SIP/2.0\r\nVia: SIP/2.0/UDP host\r\n\r\n";
+        let message = parse_message(raw).unwrap();
+        match message {
+            Message::Request(r) => assert_eq!(r.method, Method::Options),
             _ => panic!("expected request"),
         }
     }

@@ -1,11 +1,14 @@
 use crate::Result;
 use crate::auth::DigestChallenge;
 use crate::dialog::{Dialog, DialogState};
-use crate::message::{Message, Method, Request, Response, header_value};
+use crate::message::{Header, Message, Method, Request, Response, header_value};
 use crate::registration::{RegistrationResult, RegistrationState, RegistrationTransaction};
 use crate::transaction::InviteServerTransactionManager;
 use std::net::SocketAddr;
 use std::time::Instant;
+
+const ALLOW_HEADER_VALUE: &str = "INVITE, ACK, CANCEL, BYE, OPTIONS";
+const ACCEPT_HEADER_VALUE: &str = "application/sdp";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreRegistrationEvent {
@@ -120,6 +123,7 @@ impl SipStack {
                     Method::Cancel => self.handle_incoming_cancel(req, remote_addr, now, &mut events),
                     Method::Ack    => self.handle_incoming_ack(req, now, &mut events),
                     Method::Bye    => self.handle_incoming_bye(req, &mut events),
+                    Method::Options => self.handle_incoming_options(req, &mut events),
                     m => { log::warn!("on_message: unhandled request: {}", m); },
                 }
             }
@@ -221,6 +225,27 @@ impl SipStack {
             }
             Err(_e) => {
                 // log::warn!("handle_incoming_bye: {:?}", e);
+            }
+        }
+    }
+
+    fn handle_incoming_options(
+        &mut self,
+        req: Request,
+        events: &mut Vec<CoreEvent>,
+    ) {
+        match self.dialog.build_response_for_request(&req, 200, "OK", None) {
+            Ok(mut resp) => {
+                if let Ok(allow) = Header::new("Allow", ALLOW_HEADER_VALUE) {
+                    resp.add_header(allow);
+                }
+                if let Ok(accept) = Header::new("Accept", ACCEPT_HEADER_VALUE) {
+                    resp.add_header(accept);
+                }
+                let _ = events.push(CoreEvent::SendResponse(resp));
+            }
+            Err(e) => {
+                log::warn!("handle_incoming_options: {:?}", e);
             }
         }
     }
