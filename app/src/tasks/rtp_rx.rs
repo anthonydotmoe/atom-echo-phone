@@ -204,6 +204,12 @@ impl RtpRxTask {
             pkt.payload.len()
         );
 
+        // Simple echo loopback so the caller hears what they sent.
+        let target = self.remote_addr.unwrap_or(addr);
+        if let Err(e) = self.socket.send_to(data, target) {
+            log::debug!("RTP RX: failed to echo packet to {}: {:?}", target, e);
+        }
+
         if let Err(e) = self.media_tx.send(MediaIn::RtpPcmuPacket(pkt)) {
             log::warn!("RTP RX: failed to forward packet to audio: {:?}", e);
         }
