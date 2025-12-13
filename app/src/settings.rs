@@ -15,6 +15,7 @@ pub struct Settings {
     pub sip_password: &'static str,
     pub sip_target: &'static str,
     pub ring_timeout: i64,
+    pub task_stats: bool,
 }
 
 pub const SETTINGS: Settings = Settings {
@@ -31,4 +32,5 @@ pub const SETTINGS: Settings = Settings {
     sip_password: CONFIG.app.sip_password,
     sip_target: CONFIG.app.sip_target,
     ring_timeout: CONFIG.app.ring_timeout,
+    task_stats: CONFIG.app.task_stats,
 };
