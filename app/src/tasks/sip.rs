@@ -282,7 +282,7 @@ impl SipTask {
                                 }
                             }
                             Err(e) => {
-                                log::error!("parse_message: {:?}", e);
+                                log::error!("parse_message: {:?}\r\n{}", e, text);
                             }
                         }
 
