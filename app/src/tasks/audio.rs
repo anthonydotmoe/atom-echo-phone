@@ -1,5 +1,5 @@
-use std::sync::mpsc::TryRecvError;
-use std::thread;
+use std::sync::mpsc::RecvTimeoutError;
+use std::{sync::mpsc::TryRecvError, time::Instant};
 use std::time::Duration;
 
 use atom_echo_hw::AudioDevice;
@@ -46,7 +46,7 @@ impl AppTask for AudioTask {
     fn meta(&self) -> TaskMeta {
         TaskMeta {
             name: "audio",
-            stack_bytes: None,
+            stack_bytes: Some(16384),
         }
     }
 }
@@ -70,20 +70,68 @@ impl AudioTask {
 
     fn run(&mut self) {
         loop {
+            if !self.playing {
+                // IDLE
+                // block until we get a command
+                match self.cmd_rx.recv() {
+                    Ok(cmd) => self.handle_command(cmd),
+                    Err(_) => break, // command channel closed
+                }
+
+                // After handling a command, drain any queued commands quickly
+                if !self.poll_commands() {
+                    break;
+                }
+            }
+
+            // PLAYING
+            // Drain commands (non-blocking)
             if !self.poll_commands() {
                 break;
             }
 
+            // Drain media (non-blocking)
             self.poll_media();
 
-            if self.playing {
-                self.maybe_feed_i2s();
-            }
+            // Wait until its time to play the next frame, but wake up
+            // periodically so commands can be handled even if no media arrives
+            self.wait_until_next_playout_or_command();
+            self.maybe_feed_i2s();
 
-            thread::sleep(Duration::from_millis(8));
         }
 
         self.stop_tx()
+    }
+
+    fn wait_until_next_playout_or_command(&mut self) {
+        // If we don't have a schedule yet, let `maybe_feed_i2s` init it.
+        let Some(deadline) = self.next_playout_deadline else {
+            return;
+        };
+
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+
+        // Sleep by blocking on the command queue with timeout
+        // If a command arrives, handle it immediately
+        let timeout = deadline - now;
+
+        match self.cmd_rx.recv_timeout(timeout) {
+            Ok(cmd) => {
+                self.handle_command(cmd);
+                // After a command, drain any queued commands so we're responsive
+                let _ = self.poll_commands();
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // deadline reached, return to let caller feed I2S
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                // treat as shutdown
+                self.playing = false;
+            }
+        }
     }
 
     fn maybe_feed_i2s(&mut self) {

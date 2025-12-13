@@ -65,7 +65,7 @@ impl AppTask for SipTask {
     fn meta(&self) -> TaskMeta {
         TaskMeta {
             name: "sip",
-            stack_bytes: None,
+            stack_bytes: Some(16384),
         }
     }
 }

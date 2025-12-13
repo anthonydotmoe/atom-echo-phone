@@ -33,7 +33,7 @@ impl AppTask for RtpRxTask {
     fn meta(&self) -> TaskMeta {
         TaskMeta {
             name: "rtp_rx",
-            stack_bytes: None,
+            stack_bytes: Some(16384),
         }
     }
 }
