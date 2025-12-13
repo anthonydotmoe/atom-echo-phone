@@ -90,20 +90,20 @@ impl UiTask {
         let led = match state {
             PhoneState::Idle => LedState::Color {
                 red: 0,
-                green: 16,
+                green: 255,
                 blue: 0,
             },
             PhoneState::Ringing => {
                 LedState::Color {
-                    red: 32,
-                    green: 16,
+                    red: 255,
+                    green: 255,
                     blue: 0,
                 }
             }
             PhoneState::Established => LedState::Color {
                 red: 0,
                 green: 0,
-                blue: 16,
+                blue: 255,
             },
         };
         log::debug!("ui_task: LED set for state {:?}", state);
