@@ -6,7 +6,7 @@ use std::sync::mpsc::channel;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use atom_echo_hw::{Device, WifiConfig};
+use hardware::{Device, WifiConfig};
 use esp_idf_svc::sys;
 use log::info;
 use thiserror::Error;

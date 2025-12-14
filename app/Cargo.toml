@@ -11,7 +11,7 @@ path = "src/main.rs"
 [dependencies]
 log.workspace = true
 thiserror.workspace = true
-atom_echo_hw = { path = "../atom_echo_hw" }
+hardware = { path = "../hardware" }
 rtp_audio = { path = "../rtp_audio", features = ["table_decode"]}
 sdp = { path = "../sdp" }
 sip_core = { path = "../sip_core" }

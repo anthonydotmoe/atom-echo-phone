@@ -2,7 +2,7 @@ use std::sync::mpsc::TryRecvError;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use atom_echo_hw::{ButtonState, LedState, UiDevice};
+use hardware::{ButtonState, LedState, UiDevice};
 
 use crate::messages::{
     PhoneState, SipCommand, SipCommandSender, UiCommand, UiCommandReceiver

@@ -2,7 +2,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::{sync::mpsc::TryRecvError, time::Instant};
 use std::time::Duration;
 
-use atom_echo_hw::AudioDevice;
+use hardware::AudioDevice;
 use rtp_audio::{decode_ulaw, JitterBuffer};
 use crate::{
     messages::{

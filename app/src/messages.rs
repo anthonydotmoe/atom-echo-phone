@@ -1,6 +1,6 @@
 use std::sync::mpsc::{Receiver, Sender};
 
-use atom_echo_hw::{ButtonState, LedState};
+use hardware::{ButtonState, LedState};
 use heapless::{String as HString, Vec as HVec};
 use rtp_audio::RtpPacket;
 

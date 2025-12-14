@@ -4,7 +4,7 @@ members = [
     "sip_core",
     "sdp",
     "rtp_audio",
-    "atom_echo_hw",
+    "hardware",
 ]
 resolver = "2"
 
