@@ -10,7 +10,8 @@ use std::net::IpAddr;
 
 use heapless::String;
 
-pub use crate::imp::{AudioDevice, UiDevice};
+pub use crate::audio::{AudioDevice, AudioSink};
+pub use crate::imp::UiDevice;
 
 pub type SmallString<const N: usize> = String<N>;
 
@@ -108,6 +109,7 @@ impl Device {
     }
 }
 
+mod audio;
 // Platform-specific implementation lives in `imp`:
 mod imp;
 
