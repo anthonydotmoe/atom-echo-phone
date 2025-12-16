@@ -4,12 +4,6 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
-[features]
-default = ["audio-i2s-simple"]
-audio-i2s-simple = []
-audio-es8311 = []
-audio-host = []
-
 [dependencies]
 log.workspace = true
 thiserror.workspace = true
