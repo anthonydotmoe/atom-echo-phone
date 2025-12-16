@@ -4,6 +4,13 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# pick one
+board_atom_echo = []
+board_s3_touch  = []
+
+#default = ["board_atom_echo"]
+
 [dependencies]
 log.workspace = true
 thiserror.workspace = true
