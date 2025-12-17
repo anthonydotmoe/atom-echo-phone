@@ -19,7 +19,7 @@ pub enum AudioMode {
 pub enum ButtonEvent {
     StateChanged(ButtonState),
     ShortPress,
-    LongPress,
+    DoubleTap,
 }
 
 #[derive(Debug)]
