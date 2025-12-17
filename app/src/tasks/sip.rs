@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use heapless::String as HString;
 use sdp::{MediaDescription, SessionDescription};
 use sip_core::{
-    CoreDialogEvent, CoreEvent, CoreRegistrationEvent, DigestCredentials, InviteKind, RegistrationResult, RegistrationState, SipStack, authorization_header, header_value
+    CoreDialogEvent, CoreEvent, CoreRegistrationEvent, DigestCredentials,
+    InviteKind, RegistrationResult, RegistrationState, SipStack,
+    authorization_header,
 };
 
 use crate::tasks::task::{AppTask, TaskMeta};
@@ -448,7 +450,9 @@ impl SipTask {
         );
 
         // Send 180 Ringing
-        self.send_response_180_ringing(&req, remote_addr);
+        if let Err(e) = self.send_response_180_ringing(&req, remote_addr) {
+            log::warn!("failed to send 180: {:?}", e);
+        }
 
         // Store state
         self.call_ctx = Some(CallContext {
@@ -476,7 +480,10 @@ impl SipTask {
                 }
                 Err(e) => {
                     log::warn!("failed to parse SDP on re-INVITE: {:?}", e);
-                    // TODO: send 488
+                    if let Err(e) = self.send_response_488_not_acceptable_here(&req, remote_addr) {
+                        log::warn!("failed to send 488: {:?}", e);
+                    }
+                    return;
                 }
             }
         }
@@ -635,21 +642,18 @@ impl SipTask {
     }
 
     fn handle_button_event(&mut self, event: ButtonEvent) {
-        log::info!("received button event {:?}", event);
+        log::debug!("received button event {:?}", event);
 
         match event {
-            ButtonEvent::ShortPress => self.handle_answer_or_hangup(),
+            ButtonEvent::ShortPress => self.handle_answer(),
+            ButtonEvent::DoubleTap  => self.handle_hangup(),
             _ => {}
         }
-        // TODO: wire in call control (answer, hangup, etc.)
-        // Using:
-        // - self.core.dialog.start_outgoing(...)
-        // - self.core.dialog.build_bye(...)
-        // - plus RTP commands and UI updates.
     }
 
-    fn handle_answer_or_hangup(&mut self) {
+    fn handle_answer(&mut self) {
         match (&self.core.dialog.state, &self.call_ctx) {
+
             // Incoming call, ringing: answer
             (
                 sip_core::DialogState::Ringing { role, .. },
@@ -672,19 +676,25 @@ impl SipTask {
 
             }
 
-            // Established call: hang up
-            (
-                sip_core::DialogState::Established { .. },
-                Some(_ctx),
-            ) => {
-                // TODO: Build BYE, send it, stop RTP...
+            // Button pressed in some other state
+            _ => {}
+        }
+    }
+
+    fn handle_hangup(&mut self) {
+        match &self.call_ctx {
+
+            // Established call, not ringing
+            Some(ctx) if ctx.ring_deadline.is_none() => {
+                // TODO: Build BYE, send it
+                // Probably implement an "end dialog" helper in core
                 self.stop_rtp_streams();
                 self.core.dialog.terminate_local();
                 self.broadcast_phone_state();
                 self.call_ctx = None;
             }
 
-            // Button pressed in some other state
+            // Double-tap in some other state
             _ => {}
         }
     }
@@ -699,12 +709,6 @@ impl SipTask {
                 codec: sdp::Codec::Pcmu,
             }
         }
-    }
-
-    fn answer_call(&mut self) {}
-
-    fn end_call(&mut self) {
-        self.call_ctx = None;
     }
 
     fn check_call_timeouts(&mut self, now: Instant) {
