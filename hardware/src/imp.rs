@@ -82,7 +82,7 @@ mod esp {
         let ws = pins.gpio33;
 
         // 16-bit PCM at 8 kHz, Philips standard.
-        let speaker_config = StdConfig::msb(8_000, esp_idf_hal::i2s::config::DataBitWidth::Bits16);
+        let speaker_config = StdConfig::philips(8_000, esp_idf_hal::i2s::config::DataBitWidth::Bits16);
 
         let speaker = I2sDriver::<I2sTx>::new_std_tx(
             peripherals.i2s0,
