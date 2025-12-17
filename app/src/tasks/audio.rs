@@ -2,7 +2,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::{sync::mpsc::TryRecvError, time::Instant};
 use std::time::Duration;
 
-use hardware::{AudioDevice, MicSource, SpeakerSink};
+use hardware::AudioDevice;
 use rtp_audio::{decode_ulaw, JitterBuffer};
 use crate::{
     messages::{
@@ -28,8 +28,6 @@ enum TxState {
 pub struct AudioTask {
     cmd_rx: AudioCommandReceiver,
     audio_device: AudioDevice,
-    _spk: Option<Box<dyn SpeakerSink + Send>>,
-    _mic: Option<Box<dyn MicSource + Send>>,
     media_rx: MediaInReceiver,
     playing: bool,
     tx_state: TxState,
@@ -62,8 +60,6 @@ impl AudioTask {
         Self {
             cmd_rx,
             audio_device,
-            _spk: None,
-            _mic: None,
             media_rx,
             playing: false,
             tx_state: TxState::Ready,
