@@ -469,23 +469,31 @@ impl SipTask {
     }
 
     fn on_incoming_reinvite(&mut self, req: sip_core::Request, remote_addr: SocketAddr) {
-        // Update remote SDP if provided
-        if !req.body.is_empty() {
-            match sdp::parse(req.body.as_str()) {
-                Ok(sdp) => {
-                    if let Some(ctx) = &mut self.call_ctx {
-                        ctx.remote_sdp = sdp;
-                        self.start_rtp_streams_from_ctx();
-                    }
-                }
-                Err(e) => {
-                    log::warn!("failed to parse SDP on re-INVITE: {:?}", e);
-                    if let Err(e) = self.send_response_488_not_acceptable_here(&req, remote_addr) {
-                        log::warn!("failed to send 488: {:?}", e);
-                    }
-                    return;
-                }
+        // Check for an SDP
+        if req.body.is_empty() {
+            // offerless INVITE
+            log::warn!("received offerless re-INVITE");
+            if let Err(e) = self.send_response_488_not_acceptable_here(&req, remote_addr) {
+                log::warn!("failed to send 488: {:?}", e);
             }
+            return;
+        }
+
+        // Update remote SDP
+        let sdp = match sdp::parse(req.body.as_str()) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("failed to parse SDP on re-INVITE: {:?}", e);
+                if let Err(e) = self.send_response_488_not_acceptable_here(&req, remote_addr) {
+                    log::warn!("failed to send 488: {:?}", e);
+                }
+                return;
+            }
+        };
+
+        if let Some(ctx) = &mut self.call_ctx {
+            ctx.remote_sdp = sdp;
+            self.start_rtp_streams_from_ctx();
         }
 
         // For now, just acknowledge with our current local SDP
