@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use hardware::{ButtonState, LedState, UiDevice};
 
 use crate::messages::{
-    PhoneState, SipCommand, SipCommandSender, UiCommand, UiCommandReceiver
+    ButtonEvent, PhoneState, SipCommand, SipCommandSender, UiCommand, UiCommandReceiver
 };
 
 use crate::tasks::task::{AppTask, TaskMeta};
@@ -137,12 +137,22 @@ impl UiTask {
     fn poll_button(&mut self) {
         let state = self.ui_device.read_button_state();
 
+        if state != self.last_button_state {
+            // State changed
+            log::info!("ui_task: button state changed");
+            let _ = self.sip_tx.send(
+                SipCommand::Button(ButtonEvent::StateChanged(state))
+            );
+        }
+
         // Edge: button was just pressed
         if matches!(self.last_button_state, ButtonState::Released)
             && matches!(state, ButtonState::Pressed)
         {
             log::info!("ui_task: button press detected");
-            let _ = self.sip_tx.send(SipCommand::Button(crate::messages::ButtonEvent::ShortPress));
+            let _ = self.sip_tx.send(
+                SipCommand::Button(ButtonEvent::ShortPress)
+            );
         }
 
         self.last_button_state = state;
