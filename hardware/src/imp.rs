@@ -51,6 +51,75 @@ mod esp {
         let peripherals = Peripherals::take().map_err(map_wifi_err)?;
         let sysloop = EspSystemEventLoop::take().map_err(map_wifi_err)?;
         let nvs = EspDefaultNvsPartition::take().map_err(map_wifi_err)?;
+        let pins = peripherals.pins;
+
+        // LED via RMT-driven WS2812
+        let led_pin = pins.gpio27;
+        let led = TxRmtDriver::new(
+            peripherals.rmt.channel0,
+            led_pin,
+            &TransmitConfig::new().clock_divider(2),
+        )
+        .map_err(map_gpio_err)?;
+
+        // Button input (pull-up, active-low)
+        let button_pin = pins.gpio39;
+        let button = PinDriver::input(button_pin.downgrade_input()).map_err(map_gpio_err)?;
+
+        let mut ui_dev = UiDevice {
+            button,
+            led
+        };
+
+        // Turn off the led
+        let _ = ui_dev.set_led_state(LedState::Off);
+
+        // --- I2S audio ---
+
+        let bclk = pins.gpio19;
+        let _din = pins.gpio23;
+        let dout = pins.gpio22;
+        let ws = pins.gpio33;
+
+        // 16-bit PCM at 8 kHz, Philips standard.
+        let speaker_config = StdConfig::msb(8_000, esp_idf_hal::i2s::config::DataBitWidth::Bits16);
+
+        let speaker = I2sDriver::<I2sTx>::new_std_tx(
+            peripherals.i2s0,
+            &speaker_config,
+            bclk,
+            dout,
+            Option::<AnyIOPin>::None,
+            ws
+        )
+        .map_err(map_audio_err)?;
+
+        /*
+        // PDM
+        let mic_config = {
+            let channel_cfg = i2s::config::Config::default();
+            let clk_cfg = i2s::config::PdmRxClkConfig::from_sample_rate_hz(8_000);
+            let slot_cfg = i2s::config::PdmRxSlotConfig::from_bits_per_sample_and_slot_mode(
+                i2s::config::DataBitWidth::Bits16,
+                i2s::config::SlotMode::Mono,
+            );
+            let gpio_cfg = i2s::config::PdmRxGpioConfig::new(false);
+
+            PdmRxConfig::new(channel_cfg, clk_cfg, slot_cfg, gpio_cfg)
+        };
+
+        let mic = I2sDriver::<I2sRx>::new_pdm_rx(
+            peripherals.i2s1,
+            &mic_config,
+            bclk,
+            din
+        )
+        .map_err(map_audio_err)?;
+        */
+
+        let audio_dev = AudioDevice {
+            speaker
+        };
 
         // --- Wi-Fi ---
         let mut wifi = EspWifi::new(
@@ -101,69 +170,11 @@ mod esp {
         log::info!("Wi-Fi connected");
         log::info!("IP: {}", ip);
 
-        let pins = peripherals.pins;
-
-        // --- I2S audio ---
-
-        let bclk = pins.gpio19;
-        let _din = pins.gpio23;
-        let dout = pins.gpio22;
-        let ws = pins.gpio33;
-
-        // 16-bit PCM at 8 kHz, Philips standard.
-        let speaker_config = StdConfig::msb(8_000, esp_idf_hal::i2s::config::DataBitWidth::Bits16);
-
-        let speaker = I2sDriver::<I2sTx>::new_std_tx(
-            peripherals.i2s0,
-            &speaker_config,
-            bclk,
-            dout,
-            Option::<AnyIOPin>::None,
-            ws
-        )
-        .map_err(map_audio_err)?;
-
-        /*
-        // PDM
-        let mic_config = {
-            let channel_cfg = i2s::config::Config::default();
-            let clk_cfg = i2s::config::PdmRxClkConfig::from_sample_rate_hz(8_000);
-            let slot_cfg = i2s::config::PdmRxSlotConfig::from_bits_per_sample_and_slot_mode(
-                i2s::config::DataBitWidth::Bits16,
-                i2s::config::SlotMode::Mono,
-            );
-            let gpio_cfg = i2s::config::PdmRxGpioConfig::new(false);
-
-            PdmRxConfig::new(channel_cfg, clk_cfg, slot_cfg, gpio_cfg)
-        };
-
-        let mic = I2sDriver::<I2sRx>::new_pdm_rx(
-            peripherals.i2s1,
-            &mic_config,
-            bclk,
-            din
-        )
-        .map_err(map_audio_err)?;
-        */
-
-        // Button input (pull-up, active-low)
-        let button_pin = pins.gpio39;
-        let button = PinDriver::input(button_pin.downgrade_input()).map_err(map_gpio_err)?;
-
-        // LED via RMT-driven WS2812
-        let led_pin = pins.gpio27;
-        let led = TxRmtDriver::new(
-            peripherals.rmt.channel0,
-            led_pin,
-            &TransmitConfig::new().clock_divider(2),
-        )
-        .map_err(map_gpio_err)?;
-
         Ok(DeviceInner {
             wifi,
             addr: ip,
-            ui_device: Some(UiDevice { led, button }),
-            audio_device: Some(AudioDevice { speaker: speaker, /* mic: mic */ })
+            ui_device: Some(ui_dev),
+            audio_device: Some(audio_dev),
         })
     }
 
