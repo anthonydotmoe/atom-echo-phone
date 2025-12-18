@@ -261,6 +261,24 @@ impl<const CAP: usize, const FRAME: usize> JitterBuffer<CAP, FRAME> {
             return (frame.samples, true);
         }
 
+        // If we've overflowed and lost the expected frame, resync to the oldest
+        // available frame so we don't output a long stretch of silence.
+        if self.frames.is_full() {
+            if let Some(pos) = self
+                .frames
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, f)| f.seq)
+                .map(|(pos, _)| pos)
+            {
+                if let Some(frame) = self.frames.get(pos).cloned() {
+                    let _ = self.frames.remove(pos);
+                    self.next_seq = Some(frame.seq.wrapping_add(1));
+                    return (frame.samples, true);
+                }
+            }
+        }
+
         self.next_seq = Some(expected.wrapping_add(1));
         (silence_frame::<FRAME>(), false)
     }

@@ -197,6 +197,11 @@ mod esp {
             self.mode = AudioMode::None;
         }
 
+        /// Drop any existing TX driver; used for half-duplex PTT teardown.
+        pub fn drop_tx(&mut self) {
+            self.stop_current();
+        }
+
         fn start_tx(&mut self) -> Result<(), HardwareError> {
             self.stop_current();
 
@@ -224,6 +229,15 @@ mod esp {
 
             self.mode = AudioMode::Tx(tx);
             Ok(())
+        }
+
+        /// Ensure the TX driver exists and is in the READY state so callers can
+        /// preload before enabling.
+        pub fn ensure_tx_ready(&mut self) -> Result<(), HardwareError> {
+            match self.mode {
+                AudioMode::Tx(_) => Ok(()),
+                _ => self.start_tx(),
+            }
         }
 
         fn start_rx(&mut self) -> Result<(), HardwareError> {
@@ -279,9 +293,7 @@ mod esp {
         pub fn tx_disable(&mut self) -> Result<(), HardwareError> {
             match &mut self.mode {
                 AudioMode::Tx(tx) => {
-                    tx.tx_disable().map_err(map_audio_err)?;
-                    self.stop_current();
-                    Ok(())
+                    tx.tx_disable().map_err(map_audio_err)
                 }
                 AudioMode::Rx(_) => Err(HardwareError::Audio("invalid AudioDevice mode: Rx")),
                 AudioMode::None => Err(HardwareError::Audio("invalid AudioDevice mode: None")),
@@ -301,9 +313,8 @@ mod esp {
         /// # Errors
         /// This will return an [`EspError`] with `ESP_ERR_INVALID_STATE` if the channel is not in the `READY` state.
         pub fn tx_enable(&mut self) -> Result<(), HardwareError> {
-            self.start_tx()?;
             let AudioMode::Tx(ref mut tx) = self.mode else {
-                return Err(HardwareError::Audio("somehow not in Tx mode after start_tx()?"));
+                return Err(HardwareError::Audio("invalid AudioDevice mode: not Tx"));
             };
             
             tx.tx_enable().map_err(map_audio_err)?;
@@ -647,8 +658,18 @@ mod host {
             Ok(())
         }
 
+        /// Drop any existing TX driver; used for half-duplex PTT teardown.
+        pub fn drop_tx(&mut self) {
+            // On host this is just a no-op.
+        }
+
         /// Enable the I2S transmit channel.
         pub fn tx_enable(&mut self) -> Result<(), HardwareError> {
+            Ok(())
+        }
+
+        /// On host, there is no READY/RUNNING separation; just ensure buffers are available.
+        pub fn ensure_tx_ready(&mut self) -> Result<(), HardwareError> {
             Ok(())
         }
 

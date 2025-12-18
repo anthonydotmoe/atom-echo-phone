@@ -197,12 +197,14 @@ impl RtpRxTask {
             return;
         }
 
-        log::debug!(
+        /*
+        log::trace!(
             "received packet: seq={}, ts={}, payload_len={}",
             pkt.header.sequence_number,
             pkt.header.timestamp,
             pkt.payload.len()
         );
+        */
 
         if let Err(e) = self.media_tx.send(MediaIn::RtpPcmuPacket(pkt)) {
             log::warn!("RTP RX: failed to forward packet to audio: {:?}", e);

@@ -74,34 +74,28 @@ impl AudioTask {
 
     fn run(&mut self) {
         loop {
-            if !self.playing {
-                // IDLE
-                // block until we get a command
-                match self.cmd_rx.recv() {
-                    Ok(cmd) => self.handle_command(cmd),
-                    Err(_) => break, // command channel closed
-                }
-
-                // After handling a command, drain any queued commands quickly
-                if !self.poll_commands() {
-                    break;
-                }
-            }
-
-            // PLAYING
             // Drain commands (non-blocking)
             if !self.poll_commands() {
                 break;
             }
 
-            // Drain media (non-blocking)
+            // Always drain media so RTP doesn't back up when muted.
             self.poll_media();
 
-            // Wait until its time to play the next frame, but wake up
-            // periodically so commands can be handled even if no media arrives
-            self.wait_until_next_playout_or_command();
-            self.maybe_feed_i2s();
-
+            if self.playing {
+                // Wait until its time to play the next frame, but wake up
+                // periodically so commands can be handled even if no media arrives
+                self.wait_until_next_playout_or_command();
+                self.maybe_feed_i2s();
+            } else {
+                // Idle: block briefly for commands so we don't spin, but still
+                // re-check regularly to drain media.
+                match self.cmd_rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(cmd) => self.handle_command(cmd),
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
         }
 
         self.stop_tx()
@@ -188,22 +182,22 @@ impl AudioTask {
     fn handle_dialog_state(&mut self, phone_state: PhoneState) {
         self.call_state = phone_state;
 
-        self.update_output_mode();
+        // Clear jitter when the call ends or before a new one starts.
+        let clear_jitter = !matches!(self.call_state, PhoneState::Established);
+        self.update_output_mode(clear_jitter);
     }
 
     fn handle_mode_change(&mut self, mode: AudioMode) {
         self.mode = mode;
 
-        self.update_output_mode();
+        // PTT toggles should not wipe buffered audio.
+        self.update_output_mode(false);
     }
 
     fn poll_media(&mut self) {
         loop {
             match self.media_rx.try_recv() {
                 Ok(MediaIn::RtpPcmuPacket(pkt)) => {
-                    if !self.playing {
-                        continue;
-                    }
                     self.handle_rtp_pcmu(pkt);
                 }
                 Err(TryRecvError::Empty) => return,
@@ -259,7 +253,7 @@ impl AudioTask {
                     break;
                 }
                 Ok(n) => {
-                    log::debug!("n{}", n);
+                    //log::trace!("n{}", n);
                     data = &data[n..];
                 }
                 Err(e) => {
@@ -277,7 +271,6 @@ impl AudioTask {
 
         // Reset playout scheduling so a new call does not reuse an old deadline.
         self.next_playout_deadline = None;
-        self.jitter.reset();
         self.playing = true;
         self.start_tx();
     }
@@ -290,6 +283,12 @@ impl AudioTask {
                 self.tx_state = TxState::Stopped;
             }
             _ => {}
+        }
+
+        if let Err(e) = self.audio_device.ensure_tx_ready() {
+            log::warn!("audio: ensure_tx_ready failed: {:?}", e);
+            self.tx_state = TxState::Stopped;
+            return;
         }
 
         // At this point the underlying channel should be READY
@@ -309,29 +308,31 @@ impl AudioTask {
     }
 
     fn stop_tx(&mut self) {
-        if let TxState::Running = self.tx_state {
-            if let Err(e) = self.audio_device.tx_disable() {
-                log::warn!("audio: tx_disable failed: {:?}", e);
-            }
+        if matches!(self.tx_state, TxState::Running) {
+            // Drop the TX driver entirely for half-duplex PTT; dropping handles
+            // disabling internally.
+            self.audio_device.drop_tx();
         }
         self.tx_state = TxState::Stopped;
     }
 
-    fn stop_playback(&mut self) {
+    fn stop_playback(&mut self, clear_jitter: bool) {
         if self.playing {
             log::info!("stop playback");
         }
         self.playing = false;
         self.next_playout_deadline = None;
         self.stop_tx();
-        self.jitter.reset();
+        if clear_jitter {
+            self.jitter.reset();
+        }
     }
 
     /// Decide whether to feed the speaker based on call state and current PTT mode.
-    fn update_output_mode(&mut self) {
+    fn update_output_mode(&mut self, clear_jitter: bool) {
         match (self.call_state, self.mode) {
             (PhoneState::Established, AudioMode::Listen) => self.start_playback(),
-            _ => self.stop_playback(),
+            _ => self.stop_playback(clear_jitter),
         }
     }
 
