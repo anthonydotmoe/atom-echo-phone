@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use hardware::AudioDevice;
 use rtp_audio::{decode_ulaw, JitterBuffer};
+use crate::messages::MediaOutSender;
 use crate::{
     messages::{
         AudioCommand, AudioCommandReceiver, AudioMode,
@@ -29,6 +30,7 @@ pub struct AudioTask {
     cmd_rx: AudioCommandReceiver,
     audio_device: AudioDevice,
     media_rx: MediaInReceiver,
+    media_tx: MediaOutSender,
     call_state: PhoneState,
     mode: AudioMode,
     playing: bool,
@@ -58,11 +60,13 @@ impl AudioTask {
         cmd_rx: AudioCommandReceiver,
         audio_device: AudioDevice,
         media_rx: MediaInReceiver,
+        media_tx: MediaOutSender,
     ) -> Self {
         Self {
             cmd_rx,
             audio_device,
             media_rx,
+            media_tx,
             call_state: PhoneState::Idle,
             mode: AudioMode::Listen,
             playing: false,
