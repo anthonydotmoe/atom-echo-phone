@@ -253,7 +253,7 @@ impl SipTask {
             }
             RegistrationResult::AuthRequired => {
                 log::info!("registration: auth required; retrying soon");
-                self.next_register = Instant::now() + Duration::from_secs(1);
+                self.next_register = Instant::now();
             }
             RegistrationResult::Failed(code) => {
                 log::warn!("registration failed with status {}", code);
@@ -333,6 +333,10 @@ impl SipTask {
                 if state != self.last_reg_state {
                     self.last_reg_state = state;
                     log::info!("registration state -> {:?}", state);
+                    let is_registered = matches!(state, RegistrationState::Registered);
+                    let _ = self
+                        .ui_tx
+                        .send(UiCommand::RegistrationStateChanged(is_registered));
                 }
             }
         }

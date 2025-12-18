@@ -93,7 +93,7 @@ pub enum RtpRxCommand {
 pub type RtpRxCommandSender = Sender<RtpRxCommand>;
 pub type RtpRxCommandReceiver = Receiver<RtpRxCommand>;
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PhoneState {
     Idle,
     Ringing,
@@ -103,6 +103,7 @@ pub enum PhoneState {
 #[derive(Debug)]
 pub enum UiCommand {
     DialogStateChanged(PhoneState),
+    RegistrationStateChanged(bool),
     SetLed(LedState),
 }
 

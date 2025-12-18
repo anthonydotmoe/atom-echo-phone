@@ -14,9 +14,15 @@ pub struct UiTask {
     ui_device: UiDevice,
     ui_rx: UiCommandReceiver,
     sip_tx: SipCommandSender,
+    phone_state: PhoneState,
+    registered: bool,
     last_button_state: ButtonState,
     press_started_at: Option<Instant>,
     last_short_release_at: Option<Instant>,
+    last_led_state: Option<LedState>,
+    led_pattern: LedPattern,
+    led_on: bool,
+    next_blink_at: Instant,
     #[cfg(not(target_os = "espidf"))]
     auto_answer_deadline: Option<Instant>,
 }
@@ -51,14 +57,25 @@ impl UiTask {
         sip_tx: SipCommandSender,
     ) -> Self {
         let initial_state = ui_device.read_button_state();
+        let now = Instant::now();
+        let initial_pattern = LedPattern::for_state(PhoneState::Idle, false);
 
         Self {
             ui_device,
             ui_rx,
             sip_tx,
+            phone_state: PhoneState::Idle,
+            registered: false,
             last_button_state: initial_state,
             press_started_at: None,
             last_short_release_at: None,
+            last_led_state: None,
+            led_pattern: initial_pattern,
+            led_on: true,
+            next_blink_at: now
+                + initial_pattern
+                    .blink_period
+                    .unwrap_or_else(|| Duration::from_secs(3600)),
             #[cfg(not(target_os = "espidf"))]
             auto_answer_deadline: None,
         }
@@ -77,6 +94,7 @@ impl UiTask {
 
             self.poll_button(now);
             self.poll_auto_answer(now);
+            self.update_led(now);
 
             thread::sleep(Self::POLL_INTERVAL);
         }
@@ -104,27 +122,16 @@ impl UiTask {
             }
         }
 
-        let led = match state {
-            PhoneState::Idle => LedState::Color {
-                red: 0,
-                green: 255,
-                blue: 0,
-            },
-            PhoneState::Ringing => {
-                LedState::Color {
-                    red: 255,
-                    green: 255,
-                    blue: 0,
-                }
-            }
-            PhoneState::Established => LedState::Color {
-                red: 0,
-                green: 0,
-                blue: 255,
-            },
-        };
-        log::debug!("ui_task: LED set for state {:?}", state);
-        let _ = self.ui_device.set_led_state(led);
+        self.phone_state = state;
+        self.led_pattern = LedPattern::for_state(self.phone_state, self.registered);
+        // Force immediate update on next tick.
+        self.last_led_state = None;
+        self.led_on = true;
+        self.next_blink_at = Instant::now()
+            + self
+                .led_pattern
+                .blink_period
+                .unwrap_or_else(|| Duration::from_secs(3600));
     }
 
     fn poll_commands(&mut self) -> bool {
@@ -147,6 +154,17 @@ impl UiTask {
             }
             UiCommand::DialogStateChanged(p) => {
                 self.handle_dialog_state_changed(p);
+            }
+            UiCommand::RegistrationStateChanged(registered) => {
+                self.registered = registered;
+                self.led_pattern = LedPattern::for_state(self.phone_state, self.registered);
+                self.last_led_state = None;
+                self.led_on = true;
+                self.next_blink_at = Instant::now()
+                    + self
+                        .led_pattern
+                        .blink_period
+                        .unwrap_or_else(|| Duration::from_secs(3600));
             }
         }
     }
@@ -236,4 +254,82 @@ impl UiTask {
 
     #[cfg(target_os = "espidf")]
     fn poll_auto_answer(&mut self, _now: Instant) {}
+
+    fn update_led(&mut self, now: Instant) {
+        let desired = LedPattern::for_state(self.phone_state, self.registered);
+
+        if desired != self.led_pattern {
+            self.led_pattern = desired;
+            self.led_on = true;
+            self.next_blink_at = now
+                + desired
+                    .blink_period
+                    .unwrap_or_else(|| Duration::from_secs(3600));
+            self.last_led_state = None;
+        }
+
+        if let Some(period) = self.led_pattern.blink_period {
+            if now >= self.next_blink_at {
+                self.led_on = !self.led_on;
+                self.next_blink_at = now + period;
+            }
+        } else {
+            self.led_on = true;
+        }
+
+        let target = if self.led_on {
+            LedState::Color {
+                red: self.led_pattern.color.0,
+                green: self.led_pattern.color.1,
+                blue: self.led_pattern.color.2,
+            }
+        } else {
+            LedState::Off
+        };
+
+        if self.last_led_state != Some(target) {
+            log::debug!(
+                "ui_task: LED update state={:?} registered={} target={:?}",
+                self.phone_state,
+                self.registered,
+                target
+            );
+            let _ = self.ui_device.set_led_state(target);
+            self.last_led_state = Some(target);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LedPattern {
+    color: (u8, u8, u8),
+    blink_period: Option<Duration>,
+}
+
+impl LedPattern {
+    fn for_state(phone: PhoneState, registered: bool) -> Self {
+        match phone {
+            PhoneState::Ringing => Self {
+                color: (255, 255, 0),
+                blink_period: Some(Duration::from_millis(300)),
+            },
+            PhoneState::Established => Self {
+                color: (0, 0, 255),
+                blink_period: None,
+            },
+            PhoneState::Idle => {
+                if registered {
+                    Self {
+                        color: (0, 255, 0),
+                        blink_period: None,
+                    }
+                } else {
+                    Self {
+                        color: (255, 0, 0),
+                        blink_period: Some(Duration::from_millis(800)),
+                    }
+                }
+            }
+        }
+    }
 }
