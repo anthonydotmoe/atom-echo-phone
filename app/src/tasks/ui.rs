@@ -38,7 +38,7 @@ impl AppTask for UiTask {
     fn meta(&self) -> TaskMeta {
         TaskMeta {
             name: "ui",
-            stack_bytes: Some(16384),
+            stack_bytes: Some(4096),
         }
     }
 }
