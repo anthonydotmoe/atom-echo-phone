@@ -1,7 +1,7 @@
 //! Pure SIP core: message model, parsing/rendering,
 //! registration and dialog state machines, and high-level events.
 
-//#![forbid(unsafe_code)]
+#![forbid(unsafe_code)]
 
 mod message;
 mod auth;
