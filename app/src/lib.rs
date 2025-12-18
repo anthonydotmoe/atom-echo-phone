@@ -286,7 +286,7 @@ mod esp_specific {
             "task",
             "time",
             "% time",
-            "stack (B)",
+            "free stack",
             name_width = name_width,
         );
         let separator = "-".repeat(header.len());
@@ -303,7 +303,7 @@ mod esp_specific {
 
             let stack_str = row
                 .stack_bytes
-                .map(|b| b.to_string())
+                .map(|b| format!("{}B", b))
                 .unwrap_or_else(|| "-".to_string());
 
             let _ = writeln!(
