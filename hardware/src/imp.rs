@@ -6,6 +6,9 @@ mod esp {
     use std::time::Duration;
 
     use esp_idf_hal::delay::TickType;
+    use esp_idf_hal::i2s::config::DataBitWidth;
+    use esp_idf_hal::i2s::{self, I2S0, I2sRx};
+    use esp_idf_hal::peripheral::{Peripheral, PeripheralRef};
     use esp_idf_svc::sys as esp_idf_sys;
     use esp_idf_sys::{
         esp_eap_client_set_password, esp_eap_client_set_username,
@@ -13,7 +16,7 @@ mod esp {
     };
 
     use super::*;
-    use esp_idf_hal::gpio::{AnyIOPin, AnyInputPin, InputPin};
+    use esp_idf_hal::gpio::{AnyIOPin, AnyInputPin, AnyOutputPin, IOPin, InputPin, OutputPin};
     use esp_idf_hal::gpio::{Input, PinDriver};
     use esp_idf_hal::i2s::{config::StdConfig, I2sTx, I2sDriver};
     use esp_idf_hal::peripherals::Peripherals;
@@ -36,9 +39,23 @@ mod esp {
         audio_device: Option<AudioDevice>,
     }
 
+    struct AudioParts {
+        pub i2s0: PeripheralRef<'static, I2S0>,
+        pub bclk: PeripheralRef<'static, AnyIOPin>,
+        pub ws: PeripheralRef<'static, AnyIOPin>,
+        pub dout: PeripheralRef<'static, AnyOutputPin>,
+        pub din: PeripheralRef<'static, AnyInputPin>,
+    }
+
+    enum AudioMode {
+        None,
+        Tx(I2sDriver<'static, I2sTx>),
+        Rx(I2sDriver<'static, I2sRx>),
+    }
+
     pub struct AudioDevice {
-        speaker: I2sDriver<'static, I2sTx>,
-        /* mic: I2sDriver<'static, I2sRx>, */
+        parts: AudioParts,
+        mode: AudioMode,
     }
 
     pub struct UiDevice {
@@ -77,48 +94,21 @@ mod esp {
         // --- I2S audio ---
 
         let bclk = pins.gpio19;
-        let _din = pins.gpio23;
+        let din = pins.gpio23;
         let dout = pins.gpio22;
         let ws = pins.gpio33;
 
-        // 16-bit PCM at 8 kHz, Philips standard.
-        let speaker_config = StdConfig::philips(8_000, esp_idf_hal::i2s::config::DataBitWidth::Bits16);
-
-        let speaker = I2sDriver::<I2sTx>::new_std_tx(
-            peripherals.i2s0,
-            &speaker_config,
-            bclk,
-            dout,
-            Option::<AnyIOPin>::None,
-            ws
-        )
-        .map_err(map_audio_err)?;
-
-        /*
-        // PDM
-        let mic_config = {
-            let channel_cfg = i2s::config::Config::default();
-            let clk_cfg = i2s::config::PdmRxClkConfig::from_sample_rate_hz(8_000);
-            let slot_cfg = i2s::config::PdmRxSlotConfig::from_bits_per_sample_and_slot_mode(
-                i2s::config::DataBitWidth::Bits16,
-                i2s::config::SlotMode::Mono,
-            );
-            let gpio_cfg = i2s::config::PdmRxGpioConfig::new(false);
-
-            PdmRxConfig::new(channel_cfg, clk_cfg, slot_cfg, gpio_cfg)
+        let parts = AudioParts {
+            i2s0: peripherals.i2s0.into_ref(),
+            bclk: bclk.downgrade().into_ref(),
+            ws: ws.downgrade().into_ref(),
+            dout: dout.downgrade_output().into_ref(),
+            din: din.downgrade_input().into_ref(),
         };
 
-        let mic = I2sDriver::<I2sRx>::new_pdm_rx(
-            peripherals.i2s1,
-            &mic_config,
-            bclk,
-            din
-        )
-        .map_err(map_audio_err)?;
-        */
-
         let audio_dev = AudioDevice {
-            speaker
+            parts: parts,
+            mode: AudioMode::None,
         };
 
         // --- Wi-Fi ---
@@ -202,6 +192,78 @@ mod esp {
     }
 
     impl AudioDevice {
+        fn stop_current(&mut self) {
+            // Drop the driver before cloning peripherals
+            self.mode = AudioMode::None;
+        }
+
+        fn start_tx(&mut self) -> Result<(), HardwareError> {
+            self.stop_current();
+
+            // SAFETY: We guarantee only one I2S driver uses these peripherals
+            // at a time because we just dropped the previous driver in `stop_current`
+            let i2s0 = unsafe { self.parts.i2s0.clone_unchecked() };
+            let bclk = unsafe { self.parts.bclk.clone_unchecked() };
+            let dout = unsafe { self.parts.dout.clone_unchecked() };
+            let ws = unsafe { self.parts.ws.clone_unchecked() };
+
+            // 16-bit PCM at 8 kHz, Philips standard.
+            let speaker_config = StdConfig::philips(
+                8_000,
+                DataBitWidth::Bits16
+            );
+
+            let tx = I2sDriver::new_std_tx(
+                i2s0,
+                &speaker_config,
+                bclk,
+                dout,
+                Option::<AnyIOPin>::None,
+                ws,
+            ).map_err(map_audio_err)?;
+
+            self.mode = AudioMode::Tx(tx);
+            Ok(())
+        }
+
+        fn start_rx(&mut self) -> Result<(), HardwareError> {
+            self.stop_current();
+
+            // SAFETY: We guarantee only one I2S driver uses these peripherals
+            // at a time because we just dropped the previous driver in `stop_current`
+            let i2s0 = unsafe { self.parts.i2s0.clone_unchecked() };
+            let bclk = unsafe { self.parts.bclk.clone_unchecked() };
+            let din = unsafe { self.parts.din.clone_unchecked() };
+
+            // PDM
+            let mic_config = {
+                let channel_cfg = i2s::config::Config::default();
+                let clk_cfg = i2s::config::PdmRxClkConfig::from_sample_rate_hz(8_000);
+                let slot_cfg = i2s::config::PdmRxSlotConfig::from_bits_per_sample_and_slot_mode(
+                    i2s::config::DataBitWidth::Bits16,
+                    i2s::config::SlotMode::Mono,
+                );
+                let gpio_cfg = i2s::config::PdmRxGpioConfig::new(false);
+
+                i2s::config::PdmRxConfig::new(
+                    channel_cfg,
+                    clk_cfg,
+                    slot_cfg,
+                    gpio_cfg
+                )
+            };
+
+            let rx = I2sDriver::new_pdm_rx(
+                i2s0,
+                &mic_config,
+                bclk,
+                din,
+            ).map_err(map_audio_err)?;
+
+            self.mode = AudioMode::Rx(rx);
+            Ok(())
+        }
+
         /// Disable the I2S transmit channel.
         ///
         /// # Note
@@ -215,7 +277,15 @@ mod esp {
         /// # Errors
         /// This will return an [`EspError`] with `ESP_ERR_INVALID_STATE` if the channel is not in the `RUNNING` state.
         pub fn tx_disable(&mut self) -> Result<(), HardwareError> {
-            self.speaker.tx_disable().map_err(map_audio_err)
+            match &mut self.mode {
+                AudioMode::Tx(tx) => {
+                    tx.tx_disable().map_err(map_audio_err)?;
+                    self.stop_current();
+                    Ok(())
+                }
+                AudioMode::Rx(_) => Err(HardwareError::Audio("invalid AudioDevice mode: Rx")),
+                AudioMode::None => Err(HardwareError::Audio("invalid AudioDevice mode: None")),
+            }
         }
 
         /// Enable the I2S transmit channel.
@@ -231,7 +301,13 @@ mod esp {
         /// # Errors
         /// This will return an [`EspError`] with `ESP_ERR_INVALID_STATE` if the channel is not in the `READY` state.
         pub fn tx_enable(&mut self) -> Result<(), HardwareError> {
-            self.speaker.tx_enable().map_err(map_audio_err)
+            self.start_tx()?;
+            let AudioMode::Tx(ref mut tx) = self.mode else {
+                return Err(HardwareError::Audio("somehow not in Tx mode after start_tx()?"));
+            };
+            
+            tx.tx_enable().map_err(map_audio_err)?;
+            Ok(())
         }
 
         /// Preload data into the transmit channel DMA buffer.
@@ -249,7 +325,11 @@ mod esp {
         /// This returns the number of bytes that have been loaded into the buffer. If this is less than the length of
         /// the data provided, the buffer is full and no more data can be loaded.
         pub fn preload_data(&mut self, data: &[u8]) -> Result<usize, HardwareError> {
-            self.speaker.preload_data(data).map_err(map_audio_err)
+            match &mut self.mode {
+                AudioMode::Tx(tx) => tx.preload_data(data).map_err(map_audio_err),
+                AudioMode::Rx(_) => Err(HardwareError::Audio("invalid AudioDevice mode: Rx")),
+                AudioMode::None => Err(HardwareError::Audio("invalid AudioDevice mode: None")),
+            }
         }
 
         /// Write data to the channel.
@@ -259,8 +339,14 @@ mod esp {
         /// # Returns
         /// This returns the number of bytes sent. This may be less than the length of the data provided.
         pub fn write(&mut self, data: &[u8], timeout: Duration) -> Result<usize, HardwareError> {
-            let tick_timeout = TickType::from(timeout);
-            self.speaker.write(data, tick_timeout.into()).map_err(map_audio_err)
+            match &mut self.mode {
+                AudioMode::Tx(tx) => {
+                    let tick_timeout = TickType::from(timeout);
+                    tx.write(data, tick_timeout.into()).map_err(map_audio_err)
+                }
+                AudioMode::Rx(_) => Err(HardwareError::Audio("invalid AudioDevice mode: Rx")),
+                AudioMode::None => Err(HardwareError::Audio("invalid AudioDevice mode: None")),
+            }
         }
     }
 

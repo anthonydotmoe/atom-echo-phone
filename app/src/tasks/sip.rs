@@ -3,6 +3,7 @@ use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use hardware::ButtonState;
 use heapless::String as HString;
 use sdp::{MediaDescription, SessionDescription};
 use sip_core::{
@@ -14,9 +15,10 @@ use sip_core::{
 use crate::tasks::task::{AppTask, TaskMeta};
 use crate::messages::{
     self,
-    AudioCommand, AudioCommandSender, ButtonEvent, PhoneState,
-    RtpRxCommand, RtpRxCommandSender, RtpTxCommand, RtpTxCommandSender,
-    SipCommand, SipCommandReceiver, UiCommand, UiCommandSender
+    AudioCommand, AudioCommandSender, AudioMode, ButtonEvent, PhoneState,
+    RtpRxCommand, RtpRxCommandSender, RtpTxCommandSender,
+    SipCommand, SipCommandReceiver,
+    UiCommand, UiCommandSender,
 };
 
 #[derive(Debug)]
@@ -659,7 +661,7 @@ impl SipTask {
         match event {
             ButtonEvent::ShortPress => self.handle_answer(),
             ButtonEvent::DoubleTap  => self.handle_hangup(),
-            _ => {}
+            ButtonEvent::StateChanged(s) => self.handle_button_state_changed(s),
         }
     }
 
@@ -709,6 +711,25 @@ impl SipTask {
             // Double-tap in some other state
             _ => {}
         }
+    }
+
+    fn handle_button_state_changed(&mut self, state: ButtonState) {
+        if let None = self.call_ctx {
+            return;
+        }
+
+        // Established call
+        match state {
+            ButtonState::Pressed => {
+                log::info!("PTT Enable!");
+                let _ = self.audio_tx.send(AudioCommand::SetMode(AudioMode::Talk));
+            }
+            ButtonState::Released => {
+                log::info!("PTT Release!");
+                let _ = self.audio_tx.send(AudioCommand::SetMode(AudioMode::Listen));
+            }
+        }
+
     }
 
     fn build_local_sdp(&self) -> SessionDescription {

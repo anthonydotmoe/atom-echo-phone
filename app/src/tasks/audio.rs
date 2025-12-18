@@ -6,7 +6,7 @@ use hardware::AudioDevice;
 use rtp_audio::{decode_ulaw, JitterBuffer};
 use crate::{
     messages::{
-        AudioCodec, AudioCommand, AudioCommandReceiver,
+        AudioCommand, AudioCommandReceiver, AudioMode,
         MediaIn, MediaInReceiver, PhoneState, RxRtpPacket
     },
     tasks::task::{AppTask, TaskMeta}
@@ -29,6 +29,8 @@ pub struct AudioTask {
     cmd_rx: AudioCommandReceiver,
     audio_device: AudioDevice,
     media_rx: MediaInReceiver,
+    call_state: PhoneState,
+    mode: AudioMode,
     playing: bool,
     tx_state: TxState,
 
@@ -61,6 +63,8 @@ impl AudioTask {
             cmd_rx,
             audio_device,
             media_rx,
+            call_state: PhoneState::Idle,
+            mode: AudioMode::Listen,
             playing: false,
             tx_state: TxState::Ready,
             jitter: Jb::new(),
@@ -172,45 +176,25 @@ impl AudioTask {
 
     fn handle_command(&mut self, cmd: AudioCommand) {
         match cmd {
-            AudioCommand::StartRtpPlayback { codec, sample_rate } => {
-                // configure I2S for TX at given sample_rate if needed
-                log::info!("audio: start playback {:?} @ {} Hz", codec, sample_rate);
-                // Reset playout scheduling so a new call does not reuse an old deadline.
-                self.next_playout_deadline = None;
-                self.jitter.reset();
-                self.start_tx();
-                self.playing = true;
-            }
-            AudioCommand::StopPlayback => {
-                log::info!("audio: stop playback");
-                self.playing = false;
-                self.next_playout_deadline = None;
-                self.stop_tx();
-                self.jitter.reset();
-                // Mute I2S / stop TX
-            }
             AudioCommand::SetDialogState(p) => {
                 self.handle_dialog_state(p);
             }
-            other_cmd => {
-                log::warn!("audio: unhandled command: {:?}", other_cmd);
+            AudioCommand::SetMode(mode) => {
+                self.handle_mode_change(mode);
             }
         }
     }
 
     fn handle_dialog_state(&mut self, phone_state: PhoneState) {
-        match phone_state {
-            PhoneState::Idle => {
-                //log::info!("Jb:\r\n{:#?}", self.jitter);
-                self.handle_command(AudioCommand::StopPlayback);
-            }
-            PhoneState::Ringing => {
-                self.handle_command(AudioCommand::StopPlayback);
-            }
-            PhoneState::Established => {
-                self.handle_command(AudioCommand::StartRtpPlayback { codec: AudioCodec::Pcmu8k, sample_rate: 8000 });
-            }
-        }
+        self.call_state = phone_state;
+
+        self.update_output_mode();
+    }
+
+    fn handle_mode_change(&mut self, mode: AudioMode) {
+        self.mode = mode;
+
+        self.update_output_mode();
     }
 
     fn poll_media(&mut self) {
@@ -286,6 +270,18 @@ impl AudioTask {
         }
     }
 
+    fn start_playback(&mut self) {
+        if self.playing {
+            return;
+        }
+
+        // Reset playout scheduling so a new call does not reuse an old deadline.
+        self.next_playout_deadline = None;
+        self.jitter.reset();
+        self.playing = true;
+        self.start_tx();
+    }
+
     fn start_tx(&mut self) {
         // Try to get back to READY no matter what previous state was.
         match self.tx_state {
@@ -321,6 +317,24 @@ impl AudioTask {
         self.tx_state = TxState::Stopped;
     }
 
+    fn stop_playback(&mut self) {
+        if self.playing {
+            log::info!("stop playback");
+        }
+        self.playing = false;
+        self.next_playout_deadline = None;
+        self.stop_tx();
+        self.jitter.reset();
+    }
+
+    /// Decide whether to feed the speaker based on call state and current PTT mode.
+    fn update_output_mode(&mut self) {
+        match (self.call_state, self.mode) {
+            (PhoneState::Established, AudioMode::Listen) => self.start_playback(),
+            _ => self.stop_playback(),
+        }
+    }
+
     fn prime_dma_with_silence(&mut self, frames: usize) {
         let bytes: &[u8] = bytemuck::cast_slice(&SILENCE_FRAME);
 
@@ -352,7 +366,7 @@ pub fn audio_test(mut audio: AudioDevice) -> ! {
     use std::f32::consts::PI;
     audio.tx_enable().unwrap();
 
-    let mut frame_count = 100;
+    let frame_count = 100;
 
     const SR: u32 = 48_000;
     const FRAME: usize = 160; // 20 ms
@@ -388,9 +402,8 @@ pub fn audio_test(mut audio: AudioDevice) -> ! {
         }
     }
 
-    audio.tx_disable();
+    let _ = audio.tx_disable();
     log::debug!("DONE");
 
     loop {}
 }
-

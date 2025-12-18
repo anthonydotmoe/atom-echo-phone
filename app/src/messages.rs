@@ -5,12 +5,10 @@ use heapless::{String as HString, Vec as HVec};
 use rtp_audio::RtpPacket;
 
 /// High-level call mode from the perspective of audio:
-/// - Idle: no call
 /// - Listen: speaker on, mic muted
 /// - Talk: speaker muted, mic forwarded to network
 #[derive(Debug, Clone, Copy)]
 pub enum AudioMode {
-    Idle,
     Listen,
     Talk,
 }
@@ -40,13 +38,6 @@ pub enum AudioCodec {
 pub enum AudioCommand {
     /// High-level mode change: Idle/Listen/Talk
     SetMode(AudioMode),
-
-    StartRtpPlayback {
-        codec: AudioCodec,
-        sample_rate: u32,
-    },
-
-    StopPlayback,
 
     /// Inform audio of call state if it needs to behave differently
     /// (e.g. play ringback tone vs remote audio)
