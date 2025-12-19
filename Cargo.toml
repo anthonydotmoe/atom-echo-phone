@@ -16,7 +16,7 @@ rust-version = "1.77"
 embuild = { version = "0.33", features = ["espidf"] }
 heapless = "0.8"
 log = "0.4"
-thiserror = "1.0"
+thiserror = { version = "2", default-features = false }
 
 [profile.release]
 opt-level = "s"
