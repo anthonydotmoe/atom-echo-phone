@@ -289,38 +289,16 @@ impl RtpTask {
 
     fn build_payload(&mut self) -> heapless::Vec<u8, 512> {
         match self.media_out_rx.try_recv() {
-            Ok(MediaOut::PcmFrame(samples)) => {
-                // For PCMU this is fine; for other codecs, this needs to be a
-                // codec-specific encoder + frame sizing.
-                encode_ulaw(&samples)
+            Ok(MediaOut::PcmFrame(samples)) => encode_ulaw(&samples),
+            Err(TryRecvError::Empty) => {
+                // Send silence when no frame is ready.
+                const SILENCE: [i16; 160] = [0; 160];
+                encode_ulaw(&SILENCE)
             }
-            Err(TryRecvError::Empty) => self.tone_payload(),
             Err(TryRecvError::Disconnected) => {
                 self.active = false;
                 heapless::Vec::new()
             }
         }
-    }
-
-    fn tone_payload(&mut self) -> heapless::Vec<u8, 512> {
-        const AMP: f32 = 8_000.0;
-        const FREQ: f32 = 447.0;
-        static mut PHASE: f32 = 0.0;
-
-        let step = 2.0 * std::f32::consts::PI * FREQ / 8_000.0;
-
-        // Generate one frame of PCM tone and encode to μ-law.
-        let mut pcm = [0i16; 160];
-        unsafe {
-            for s in &mut pcm {
-                *s = (PHASE.sin() * AMP) as i16;
-                PHASE += step;
-                if PHASE > 2.0 * std::f32::consts::PI {
-                    PHASE -= 2.0 * std::f32::consts::PI;
-                }
-            }
-        }
-
-        encode_ulaw(&pcm)
     }
 }

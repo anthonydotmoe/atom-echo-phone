@@ -192,14 +192,9 @@ mod esp {
     }
 
     impl AudioDevice {
-        fn stop_current(&mut self) {
+        pub fn stop_current(&mut self) {
             // Drop the driver before cloning peripherals
             self.mode = AudioMode::None;
-        }
-
-        /// Drop any existing TX driver; used for half-duplex PTT teardown.
-        pub fn drop_tx(&mut self) {
-            self.stop_current();
         }
 
         fn start_tx(&mut self) -> Result<(), HardwareError> {
@@ -267,12 +262,15 @@ mod esp {
                 )
             };
 
-            let rx = I2sDriver::new_pdm_rx(
+            let mut rx = I2sDriver::new_pdm_rx(
                 i2s0,
                 &mic_config,
                 bclk,
                 din,
             ).map_err(map_audio_err)?;
+
+            // And enable the I2S channel immediately
+            rx.rx_enable().map_err(map_audio_err)?;
 
             self.mode = AudioMode::Rx(rx);
             Ok(())
@@ -312,6 +310,13 @@ mod esp {
                 }
                 AudioMode::Rx(_) => Err(HardwareError::Audio("invalid AudioDevice mode: Rx")),
                 AudioMode::None => Err(HardwareError::Audio("invalid AudioDevice mode: None")),
+            }
+        }
+
+        pub fn ensure_rx_ready(&mut self) -> Result<(), HardwareError> {
+            match self.mode {
+                AudioMode::Rx(_) => Ok(()),
+                _ => self.start_rx(),
             }
         }
 
