@@ -21,11 +21,28 @@ const FRAME_DURATION: Duration = Duration::from_millis(20);
 
 type Jb = JitterBuffer<10, FRAME_SAMPLES_8K>;
 
+#[derive(Debug, Clone, Copy)]
+enum Engine {
+    Off,
+    Listen { next: Option<Instant> },
+    Talk { next: Option<Instant> },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Personality {
-    Idle,
+enum EngineKind {
+    Off,
     Listen,
-    Talk,
+    Talk
+}
+
+impl Engine {
+    const fn kind(&self) -> EngineKind {
+        match self {
+            Engine::Off => EngineKind::Off,
+            Engine::Listen { .. } => EngineKind::Listen,
+            Engine::Talk { .. } => EngineKind::Talk,
+        }
+    }
 }
 
 pub struct AudioTask {
@@ -35,17 +52,13 @@ pub struct AudioTask {
     media_tx: MediaOutSender,
     call_state: PhoneState,
     mode: AudioMode,
-    persona: Personality,
+    engine: Engine,
 
     // Listen side
     jitter: Jb,
-    next_playout_deadline: Option<Instant>,
-    speaker_running: bool,
 
     // Talk side
-    next_capture_deadline: Option<Instant>,
     inject_tone_as_mic: bool,
-    mic_running: bool,
     
     // Tone generator
     tone_phase: f32,
@@ -80,15 +93,11 @@ impl AudioTask {
             media_tx,
             call_state: PhoneState::Idle,
             mode: AudioMode::Listen,
-            persona: Personality::Idle,
+            engine: Engine::Off,
 
             jitter: Jb::new(),
-            next_playout_deadline: None,
-            speaker_running: false,
 
-            next_capture_deadline: None,
             inject_tone_as_mic: false,
-            mic_running: false,
 
             tone_phase: 0.0,
         }
@@ -104,10 +113,10 @@ impl AudioTask {
             // Always drain inbound RTP media so jitter stays current
             self.poll_media();
 
-            self.update_personality();
+            self.update_engine();
 
-            match self.persona {
-                Personality::Idle => {
+            match self.engine {
+                Engine::Off => {
                     // Block a bit so we don't spin, but keep checking commands
                     match self.cmd_rx.recv_timeout(Duration::from_millis(50)) {
                         Ok(cmd) => self.handle_command(cmd),
@@ -116,19 +125,19 @@ impl AudioTask {
                     }
                 }
 
-                Personality::Listen => {
-                    self.wait_until_next_deadline_or_command(self.next_playout_deadline);
+                Engine::Listen { next } => {
+                    self.wait_until_next_deadline_or_command(next);
                     self.maybe_playout_one_frame();
                 }
 
-                Personality::Talk => {
-                    self.wait_until_next_deadline_or_command(self.next_capture_deadline);
+                Engine::Talk{ next } => {
+                    self.wait_until_next_deadline_or_command(next);
                     self.maybe_capture_one_frame();
                 }
             }
         }
 
-        self.teardown_all();
+        self.stop_engine();
     }
 
     fn poll_commands(&mut self) -> bool {
@@ -175,47 +184,63 @@ impl AudioTask {
         self.jitter.push_frame(pkt.header.sequence_number, &decoded);
     }
 
-    fn update_personality(&mut self) {
+    fn update_engine(&mut self) {
         let want = match (self.call_state, self.mode) {
-            (PhoneState::Established, AudioMode::Listen) => Personality::Listen,
-            (PhoneState::Established, AudioMode::Talk) => Personality::Talk,
-            _ => Personality::Idle,
+            (PhoneState::Established, AudioMode::Listen) => EngineKind::Listen,
+            (PhoneState::Established, AudioMode::Talk) => EngineKind::Talk,
+            _ => EngineKind::Off,
         };
 
-        if want == self.persona {
+        if self.engine.kind() == want {
             return;
         }
 
         // Transition
-        self.teardown_all();
+        self.stop_engine();
+        self.start_engine(want);
+    }
 
-        self.persona = want;
+    fn start_engine(&mut self, want: EngineKind) {
+        match want {
+            EngineKind::Off => self.engine = Engine::Off,
 
-        match self.persona {
-            Personality::Idle => {
-                log::info!("Switch to Personality::Idle");
+            EngineKind::Listen => {
+                if self.audio_device.ensure_tx_ready().is_ok()
+                {
+                    self.prime_dma_with_silence(3);
+                    if let Err(e) = self.audio_device.tx_enable() {
+                        log::warn!("tx_enable failed: {:?}", e);
+                        self.engine = Engine::Off;
+                        return;
+                    }
+                    self.engine = Engine::Listen { next: None };
+                } else {
+                    self.engine = Engine::Off;
+                }
             }
 
-            Personality::Listen => {
-                log::info!("Switch to Personality::Listen");
-                self.start_speaker();
-                self.next_playout_deadline = None;
-            }
-
-            Personality::Talk => {
-                log::info!("Switch to Personality::Talk");
-                self.start_mic();
-                self.next_capture_deadline = None;
+            EngineKind::Talk => {
+                if self.audio_device.ensure_rx_ready().is_ok()
+                {
+                    self.engine = Engine::Talk { next: None };
+                } else {
+                    self.engine = Engine::Off;
+                }
             }
         }
     }
 
-    fn teardown_all(&mut self) {
-        self.stop_speaker();
-        self.stop_mic();
-
-        self.next_playout_deadline = None;
-        self.next_capture_deadline = None;
+    fn stop_engine(&mut self) {
+        match self.engine {
+            Engine::Listen { .. } => {
+                self.audio_device.stop_current();
+            }
+            Engine::Talk { .. } => {
+                self.audio_device.stop_current();
+            }
+            Engine::Off => {}
+        }
+        self.engine = Engine::Off;
     }
 
     fn wait_until_next_deadline_or_command(&mut self, deadline: Option<Instant>) {
@@ -244,58 +269,29 @@ impl AudioTask {
             }
             Err(RecvTimeoutError::Disconnected) => {
                 // treat as shutdown
-                self.persona = Personality::Idle;
+                self.engine = Engine::Off;
             }
         }
     }
 
     // --- Listen personality: jitter -> I2S TX ---
-
-    fn start_speaker(&mut self) {
-        if self.speaker_running {
-            return;
-        }
-
-        // Ensure TX exists and is primed/enabled
-        if let Err(e) = self.audio_device.ensure_tx_ready() {
-            log::warn!("ensure_tx_ready failed: {:?}", e);
-            return;
-        }
-
-        // Prime & enable
-        self.prime_dma_with_silence(3);
-        if let Err(e) = self.audio_device.tx_enable() {
-            log::warn!("tx_enable failed: {:?}", e);
-            return;
-        }
-
-        self.speaker_running = true;
-    }
-
-    fn stop_speaker(&mut self) {
-        if self.speaker_running {
-            self.audio_device.stop_current();
-            self.speaker_running = false;
-        }
-    }
-
     fn maybe_playout_one_frame(&mut self) {
-        if !self.speaker_running {
+        let Engine::Listen { next } = self.engine else {
             return;
-        }
+        };
 
         let now = Instant::now();
 
-        let Some(deadline) = self.next_playout_deadline else {
+        let Some(deadline) = next else {
             // Initial buffering delay
-            self.next_playout_deadline = Some(now + FRAME_DURATION);
+            self.engine = Engine::Listen { next: Some(now + FRAME_DURATION) };
             return;
         };
 
         if now < deadline {
             return;
         }
-        self.next_playout_deadline = Some(deadline + FRAME_DURATION);
+        self.engine = Engine::Listen{ next: Some(deadline + FRAME_DURATION) };
 
         let (frame, had_real) = self.jitter.pop_frame();
         log::debug!(
@@ -361,43 +357,22 @@ impl AudioTask {
     }
 
     // --- Talk personality: mic -> MediaOut ---
-
-    fn start_mic(&mut self) {
-        if self.mic_running {
-            return;
-        }
-
-        if let Err(e) = self.audio_device.ensure_rx_ready() {
-            log::warn!("ensure_rx_ready failed: {:?}", e);
-            return;
-        }
-
-        self.mic_running = true;
-    }
-
-    fn stop_mic(&mut self) {
-        if self.mic_running {
-            self.audio_device.stop_current();
-            self.mic_running = false;
-        }
-    }
-
     fn maybe_capture_one_frame(&mut self) {
-        if !self.mic_running {
+        let Engine::Talk { next } = self.engine else {
             return;
-        }
+        };
 
         let now = Instant::now();
 
-        let Some(deadline) = self.next_capture_deadline else {
-            self.next_capture_deadline = Some(now + FRAME_DURATION);
+        let Some(deadline) = next else {
+            self.engine = Engine::Talk { next: Some(now + FRAME_DURATION) };
             return;
         };
 
         if now < deadline {
             return;
         }
-        self.next_capture_deadline = Some(deadline + FRAME_DURATION);
+        self.engine = Engine::Talk { next: Some(deadline + FRAME_DURATION) };
 
         let frame = if self.inject_tone_as_mic {
             self.gen_tone_frame_8k()
