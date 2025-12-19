@@ -252,7 +252,7 @@ mod esp {
             // PDM
             let mic_config = {
                 let channel_cfg = i2s::config::Config::default();
-                let clk_cfg = i2s::config::PdmRxClkConfig::from_sample_rate_hz(8_000);
+                let clk_cfg = i2s::config::PdmRxClkConfig::from_sample_rate_hz(16_000);
                 let slot_cfg = i2s::config::PdmRxSlotConfig::from_bits_per_sample_and_slot_mode(
                     i2s::config::DataBitWidth::Bits16,
                     i2s::config::SlotMode::Mono,
@@ -278,18 +278,6 @@ mod esp {
             Ok(())
         }
 
-        /// Disable the I2S transmit channel.
-        ///
-        /// # Note
-        /// This can only be called when the channel is in the `RUNNING` state: the channel has been previously enabled
-        /// via a call to [`tx_enable()`][I2sTxChannel::tx_enable]. The channel will enter the `READY` state if it is disabled
-        /// successfully.
-        ///
-        /// Disabling the channel will stop I2S communications on the hardware. BCLK and WS signals will stop being
-        /// generated if this is a controller. MCLK will continue to be generated.
-        ///
-        /// # Errors
-        /// This will return an [`EspError`] with `ESP_ERR_INVALID_STATE` if the channel is not in the `RUNNING` state.
         pub fn tx_disable(&mut self) -> Result<(), HardwareError> {
             match &mut self.mode {
                 AudioMode::Tx(tx) => {
@@ -300,18 +288,6 @@ mod esp {
             }
         }
 
-        /// Enable the I2S transmit channel.
-        ///
-        /// # Note
-        /// This can only be called when the channel is in the `READY` state: initialized but not yet started from a driver
-        /// constructor, or disabled from the `RUNNING` state via [`tx_disable()`][I2sTxChannel::tx_disable]. The channel
-        /// will enter the `RUNNING` state if it is enabled successfully.
-        ///
-        /// Enabling the channel will start I2S communications on the hardware. BCLK and WS signals will be generated if
-        /// this is a controller. MCLK will be generated once initialization is finished.
-        ///
-        /// # Errors
-        /// This will return an [`EspError`] with `ESP_ERR_INVALID_STATE` if the channel is not in the `READY` state.
         pub fn tx_enable(&mut self) -> Result<(), HardwareError> {
             let AudioMode::Tx(ref mut tx) = self.mode else {
                 return Err(HardwareError::Audio("invalid AudioDevice mode: not Tx"));
@@ -321,20 +297,6 @@ mod esp {
             Ok(())
         }
 
-        /// Preload data into the transmit channel DMA buffer.
-        ///
-        /// This may be called only when the channel is in the `READY` state: initialized but not yet started.
-        ///
-        /// This is used to preload data into the DMA buffer so that valid data can be transmitted immediately after the
-        /// channel is enabled via [`tx_enable()`][I2sTxChannel::tx_enable]. If this function is not called before enabling the channel,
-        /// empty data will be transmitted.
-        ///
-        /// This function can be called multiple times before enabling the channel. Additional calls will concatenate the
-        /// data to the end of the buffer until the buffer is full.
-        ///
-        /// # Returns
-        /// This returns the number of bytes that have been loaded into the buffer. If this is less than the length of
-        /// the data provided, the buffer is full and no more data can be loaded.
         pub fn preload_data(&mut self, data: &[u8]) -> Result<usize, HardwareError> {
             match &mut self.mode {
                 AudioMode::Tx(tx) => tx.preload_data(data).map_err(map_audio_err),
@@ -342,13 +304,6 @@ mod esp {
                 AudioMode::None => Err(HardwareError::Audio("invalid AudioDevice mode: None")),
             }
         }
-
-        /// Write data to the channel.
-        ///
-        /// This may be called only when the channel is in the `RUNNING` state.
-        ///
-        /// # Returns
-        /// This returns the number of bytes sent. This may be less than the length of the data provided.
         pub fn write(&mut self, data: &[u8], timeout: Duration) -> Result<usize, HardwareError> {
             match &mut self.mode {
                 AudioMode::Tx(tx) => {
@@ -358,6 +313,30 @@ mod esp {
                 AudioMode::Rx(_) => Err(HardwareError::Audio("invalid AudioDevice mode: Rx")),
                 AudioMode::None => Err(HardwareError::Audio("invalid AudioDevice mode: None")),
             }
+        }
+
+        pub fn read(&mut self, out: &mut [i16], timeout: Duration) -> Result<usize, HardwareError> {
+            out.fill(0);
+
+            let AudioMode::Rx(ref mut rx) = self.mode else {
+                return Err(HardwareError::Audio("invalid AudioDevice mode: not Rx"));
+            };
+
+            // Read raw bytes directly into the i16 buffer
+            let out_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut out[..]);
+
+            let tick_timeout = TickType::from(timeout);
+            let nbytes = rx.read(out_bytes, tick_timeout.into()).map_err(map_audio_err)?;
+
+            // Clamp to whole samples
+            let nsamples = (nbytes / core::mem::size_of::<i16>()).min(out.len());
+
+            // If the mono swap quirk shows up:
+            //for pair in out[..nsamples].chunks_exact_mut(2) {
+            //    pair.swap(0, 1);
+            //}
+
+            Ok(nsamples)
         }
     }
 
@@ -684,6 +663,10 @@ mod host {
         pub fn write(&mut self, data: &[u8], timeout: Duration) -> Result<usize, HardwareError> {
             self.buf.extend_from_slice(data);
             Ok(data.len())
+        }
+
+        pub fn read(&mut self, out: &mut [i16; 160], timeout: Duration) -> Result<usize> {
+
         }
     }
 

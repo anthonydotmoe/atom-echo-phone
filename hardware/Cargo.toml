@@ -8,6 +8,7 @@ rust-version.workspace = true
 log.workspace = true
 thiserror.workspace = true
 heapless.workspace = true
+bytemuck.workspace = true
 
 [target.'cfg(not(target_os = "espidf"))'.dependencies]
 rand = "0.9"
