@@ -660,6 +660,7 @@ mod host {
 
         /// Drop any existing TX driver; used for half-duplex PTT teardown.
         pub fn drop_tx(&mut self) {
+            let _= self.tx_disable();
             // On host this is just a no-op.
         }
 
