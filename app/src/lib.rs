@@ -9,8 +9,7 @@ use thiserror::Error;
 
 use crate::tasks::{
     audio::AudioTask,
-    rtp_rx::RtpRxTask,
-    rtp_tx::RtpTxTask,
+    rtp::RtpTask,
     sip::SipTask,
     task::{start_all, AppTask},
     ui::UiTask,
@@ -59,18 +58,17 @@ pub fn run() -> Result<(), AppError> {
     // Create channels
     let (sip_tx, sip_rx) = channel::<messages::SipCommand>();
     let (audio_tx, audio_rx) = channel::<messages::AudioCommand>();
-    let (rtp_tx_tx, rtp_tx_rx) = channel::<messages::RtpTxCommand>();
-    let (rtp_rx_tx, rtp_rx_rx) = channel::<messages::RtpRxCommand>();
+    let (rtp_cmd_tx, rtp_cmd_rx) = channel::<messages::RtpCommand>();
     let (ui_tx, ui_rx) = channel::<messages::UiCommand>();
     let (media_in_tx, media_in_rx) = channel::<messages::MediaIn>();
     let (media_out_tx, media_out_rx) = channel::<messages::MediaOut>();
 
     let ui_task = Box::new(UiTask::new(ui_device, ui_rx, sip_tx));
 
-    let rtp_rx_task = Box::new(RtpRxTask::new(rtp_socket, rtp_rx_rx, media_in_tx));
-
-    let rtp_tx_task = Box::new(RtpTxTask::new(
-        rtp_tx_rx,
+    let rtp_task = Box::new(RtpTask::new(
+        rtp_socket,
+        rtp_cmd_rx,
+        media_in_tx,
         media_out_rx,
     ));
 
@@ -81,18 +79,21 @@ pub fn run() -> Result<(), AppError> {
         sip_rx,
         ui_tx,
         audio_tx,
-        rtp_tx_tx,
-        rtp_rx_tx,
+        rtp_cmd_tx,
     ));
 
-    let audio_task = Box::new(AudioTask::new(audio_rx, audio_device, media_in_rx, media_out_tx));
+    let audio_task = Box::new(AudioTask::new(
+        audio_rx,
+        audio_device,
+        media_in_rx,
+        media_out_tx
+    ));
 
     let tasks: Vec<Box<dyn AppTask>> = vec![
         audio_task,
+        rtp_task,
+        sip_task,
         ui_task,
-        rtp_rx_task,
-        rtp_tx_task,
-        sip_task
     ];
 
     start_all(tasks);
@@ -117,7 +118,7 @@ mod esp_specific {
         time::{Duration, Instant},
     };
 
-    const USER_TASK_NAMES: &[&str] = &["audio", "rtp_rx", "rtp_tx", "sip", "ui"];
+    const USER_TASK_NAMES: &[&str] = &["audio", "rtp", "sip", "ui"];
     const RUNTIME_STATS_INTERVAL: Duration = Duration::from_secs(10);
     const STACK_WATERMARK_REFRESH: Duration = Duration::from_secs(30);
 

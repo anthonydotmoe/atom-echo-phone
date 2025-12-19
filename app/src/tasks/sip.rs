@@ -14,9 +14,8 @@ use sip_core::{
 
 use crate::tasks::task::{AppTask, TaskMeta};
 use crate::messages::{
-    self,
     AudioCommand, AudioCommandSender, AudioMode, ButtonEvent, PhoneState,
-    RtpRxCommand, RtpRxCommandSender, RtpTxCommandSender,
+    RtpCommand, RtpCommandSender,
     SipCommand, SipCommandReceiver,
     UiCommand, UiCommandSender,
 };
@@ -36,8 +35,7 @@ pub struct SipTask {
     sip_rx: SipCommandReceiver,
     ui_tx: UiCommandSender,
     audio_tx: AudioCommandSender,
-    rtp_tx_tx: RtpTxCommandSender,
-    rtp_rx_tx: RtpRxCommandSender,
+    rtp_tx: RtpCommandSender,
 
     // Core SIP logic
     core: SipStack,
@@ -82,8 +80,7 @@ impl SipTask {
         sip_rx: SipCommandReceiver,
         ui_tx: UiCommandSender,
         audio_tx: AudioCommandSender,
-        rtp_tx_tx: RtpTxCommandSender,
-        rtp_rx_tx: RtpRxCommandSender,
+        rtp_tx: RtpCommandSender,
     ) -> Self {
         let core = SipStack::default();
 
@@ -106,8 +103,7 @@ impl SipTask {
             sip_rx,
             ui_tx,
             audio_tx,
-            rtp_tx_tx,
-            rtp_rx_tx,
+            rtp_tx,
 
             core,
             call_ctx: None,
@@ -400,7 +396,10 @@ impl SipTask {
         }
 
         let mut remote_ip: HString<48> = HString::new();
-        if remote_ip.push_str(ctx.remote_sdp.connection_address.as_str()).is_err() {
+        if remote_ip
+            .push_str(ctx.remote_sdp.connection_address.as_str())
+            .is_err()
+        {
             log::warn!(
                 "start_rtp_streams_from_ctx: remote IP too long: {}",
                 ctx.remote_sdp.connection_address
@@ -408,20 +407,21 @@ impl SipTask {
             return;
         }
 
-        let cmd = RtpRxCommand::StartStream {
-            remote_ip,
+        let cmd = RtpCommand::StartStream {
+            remote_ip: remote_ip.clone(),
             remote_port: ctx.remote_sdp.media.port,
-            expected_ssrc: None,
+            expected_remote_ssrc: None,
+            local_ssrc: None,
             payload_type: ctx.remote_sdp.media.payload_type,
         };
 
-        if let Err(e) = self.rtp_rx_tx.send(cmd) {
-            log::warn!("Failed to start RTP RX: {:?}", e);
+        if let Err(e) = self.rtp_tx.send(cmd) {
+            log::warn!("Failed to start RTP: {:?}", e);
         }
     }
 
     fn stop_rtp_streams(&mut self) {
-        if let Err(e) = self.rtp_rx_tx.send(RtpRxCommand::StopStream) {
+        if let Err(e) = self.rtp_tx.send(RtpCommand::StopStream) {
             log::debug!("stop_rtp_streams: receiver dropped? {:?}", e);
         }
     }
@@ -856,13 +856,13 @@ fn local_ip_port(sock: &UdpSocket) -> (String, u16) {
     (addr.ip().to_string(), addr.port())
 }
 
-fn dialog_state_to_phone_state(dialog_state: &sip_core::DialogState) -> messages::PhoneState {
+fn dialog_state_to_phone_state(dialog_state: &sip_core::DialogState) -> PhoneState {
     match dialog_state {
-        &sip_core::DialogState::Idle => messages::PhoneState::Idle,
-        &sip_core::DialogState::Inviting => messages::PhoneState::Ringing,
-        &sip_core::DialogState::Ringing { .. } => messages::PhoneState::Ringing,
-        &sip_core::DialogState::Established { .. } => messages::PhoneState::Established,
-        &sip_core::DialogState::Terminated => messages::PhoneState::Idle,
+        &sip_core::DialogState::Idle => PhoneState::Idle,
+        &sip_core::DialogState::Inviting => PhoneState::Ringing,
+        &sip_core::DialogState::Ringing { .. } => PhoneState::Ringing,
+        &sip_core::DialogState::Established { .. } => PhoneState::Established,
+        &sip_core::DialogState::Terminated => PhoneState::Idle,
     }
 }
 

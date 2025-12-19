@@ -50,39 +50,20 @@ pub enum AudioCommand {
 pub type AudioCommandSender = Sender<AudioCommand>;
 pub type AudioCommandReceiver = Receiver<AudioCommand>;
 
-#[derive(Debug)]
-pub enum RtpTxCommand {
-    /// Start sending outbound RTP with these parameters.
+#[derive(Debug, Clone)]
+pub enum RtpCommand {
     StartStream {
         remote_ip: HString<48>,
         remote_port: u16,
-        ssrc: u32,
+        expected_remote_ssrc: Option<u32>,
+        local_ssrc: Option<u32>,
         payload_type: u8,
     },
-
-    /// Stop sending outbound RTP.
     StopStream,
 }
 
-pub type RtpTxCommandSender = Sender<RtpTxCommand>;
-pub type RtpTxCommandReceiver = Receiver<RtpTxCommand>;
-
-#[derive(Debug)]
-pub enum RtpRxCommand {
-    /// Configure inbound RTP expectations and mark the stream active.
-    StartStream {
-        remote_ip: HString<48>,
-        remote_port: u16,
-        expected_ssrc: Option<u32>,
-        payload_type: u8,
-    },
-
-    /// Stop accepting RTP for the current call.
-    StopStream,
-}
-
-pub type RtpRxCommandSender = Sender<RtpRxCommand>;
-pub type RtpRxCommandReceiver = Receiver<RtpRxCommand>;
+pub type RtpCommandSender = Sender<RtpCommand>;
+pub type RtpCommandReceiver = Receiver<RtpCommand>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PhoneState {
