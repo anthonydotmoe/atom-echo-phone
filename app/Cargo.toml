@@ -17,7 +17,7 @@ sdp = { path = "../sdp" }
 sip_core = { path = "../sip_core" }
 heapless.workspace = true
 static-toml = "1"
-bytemuck = "1.24.0"
+bytemuck.workspace = true
 
 [target.'cfg(not(target_os = "espidf"))'.dependencies]
 env_logger = "0.11"

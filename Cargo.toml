@@ -17,6 +17,7 @@ embuild = { version = "0.33", features = ["espidf"] }
 heapless = "0.8"
 log = "0.4"
 thiserror = { version = "2", default-features = false }
+bytemuck = "1.24.0"
 
 [profile.release]
 opt-level = "s"
