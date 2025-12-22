@@ -241,7 +241,7 @@ mod esp {
             // SAFETY: We guarantee only one I2S driver uses these peripherals
             // at a time because we just dropped the previous driver in `stop_current`
             let i2s0 = unsafe { self.parts.i2s0.clone_unchecked() };
-            let bclk = unsafe { self.parts.bclk.clone_unchecked() };
+            let ws = unsafe { self.parts.ws.clone_unchecked() };
             let din = unsafe { self.parts.din.clone_unchecked() };
 
             // PDM
@@ -265,7 +265,7 @@ mod esp {
             let mut rx = I2sDriver::new_pdm_rx(
                 i2s0,
                 &mic_config,
-                bclk,
+                ws,
                 din,
             ).map_err(map_audio_err)?;
 
