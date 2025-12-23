@@ -16,6 +16,7 @@ use crate::tasks::{
 };
 
 mod agc;
+mod dsp;
 mod messages;
 mod settings;
 mod tasks;

@@ -209,7 +209,7 @@ mod esp {
 
             // 16-bit PCM at 8 kHz, Philips standard.
             let speaker_config = StdConfig::philips(
-                8_000,
+                48_000,
                 DataBitWidth::Bits16
             );
 
@@ -530,7 +530,7 @@ mod host {
         fn default() -> Self {
             Self {
                 buf: Vec::new(),
-                sample_rate: 8_000,
+                sample_rate: 48_000,
                 channels: 2,
                 bits_per_sample: 16,
             }
@@ -643,7 +643,7 @@ mod host {
         }
 
         /// Drop any existing TX driver; used for half-duplex PTT teardown.
-        pub fn drop_tx(&mut self) {
+        pub fn stop_current(&mut self) {
             let _= self.tx_disable();
             // On host this is just a no-op.
         }
@@ -655,6 +655,11 @@ mod host {
 
         /// On host, there is no READY/RUNNING separation; just ensure buffers are available.
         pub fn ensure_tx_ready(&mut self) -> Result<(), HardwareError> {
+            Ok(())
+        }
+
+        /// On host, there is no READY/RUNNING separation; just ensure buffers are available.
+        pub fn ensure_rx_ready(&mut self) -> Result<(), HardwareError> {
             Ok(())
         }
 
@@ -670,8 +675,8 @@ mod host {
             Ok(data.len())
         }
 
-        pub fn read(&mut self, out: &mut [i16; 160], timeout: Duration) -> Result<usize> {
-
+        pub fn read(&mut self, out: &mut [i16; 320], timeout: Duration) -> Result<usize, HardwareError> {
+            Ok(160)
         }
     }
 

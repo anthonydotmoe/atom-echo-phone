@@ -8,6 +8,7 @@ use hardware::AudioDevice;
 use rtp_audio::{decode_ulaw, JitterBuffer};
 use crate::messages::{MediaOut, MediaOutSender};
 use crate::agc::Agc;
+use crate::dsp::Up6Polyphase;
 use crate::{
     messages::{
         AudioCommand, AudioCommandReceiver, AudioMode,
@@ -18,6 +19,7 @@ use crate::{
 
 
 const FRAME_SAMPLES_8K: usize = 160; // 20ms at 8kHz
+const FRAME_SAMPLES_48K: usize = 960; // 20ms at 48kHz
 const FRAME_DURATION: Duration = Duration::from_millis(20);
 
 type Jb = JitterBuffer<10, FRAME_SAMPLES_8K>;
@@ -57,6 +59,7 @@ pub struct AudioTask {
 
     // Listen side
     jitter: Jb,
+    up6: Up6Polyphase,
 
     // Talk side
     inject_tone_as_mic: bool,
@@ -98,6 +101,7 @@ impl AudioTask {
             engine: Engine::Off,
 
             jitter: Jb::new(),
+            up6: Up6Polyphase::new(),
 
             inject_tone_as_mic: false,
             agc: Agc::new(),
@@ -304,9 +308,21 @@ impl AudioTask {
         );
         // frame is filled with samples or silence
 
-        // Interleave to stereo
-        let mut stereo = [0i16; FRAME_SAMPLES_8K * 2];
-        for (i, s) in frame.iter().enumerate() {
+        // TODO: potentially ugly copy?
+        let frame_as_array_160 = {
+            let mut f = [0i16; FRAME_SAMPLES_8K];
+            for (i, s) in frame.iter().enumerate() {
+                f[i] = *s;
+            }
+            f
+        };
+
+        let mut out_mono_48k = [0i16; FRAME_SAMPLES_48K];
+        self.up6.process_frame(&frame_as_array_160, &mut out_mono_48k);
+
+        // Interleave to stereo and gain
+        let mut stereo = [0i16; FRAME_SAMPLES_48K * 2];
+        for (i, s) in out_mono_48k.iter().enumerate() {
             stereo[2 * i] = *s;
             stereo[2 * i + 1] = *s;
         }
@@ -337,7 +353,7 @@ impl AudioTask {
     }
 
     fn prime_dma_with_silence(&mut self, frames: usize) {
-        static SILENCE_STEREO: [i16; FRAME_SAMPLES_8K * 2] = [0i16; FRAME_SAMPLES_8K * 2];
+        static SILENCE_STEREO: [i16; FRAME_SAMPLES_48K * 2] = [0i16; FRAME_SAMPLES_48K * 2];
         let bytes: &[u8] = bytemuck::cast_slice(&SILENCE_STEREO);
 
         for _ in 0..frames {
