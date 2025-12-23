@@ -7,6 +7,7 @@ use heapless::Vec as HVec;
 use hardware::AudioDevice;
 use rtp_audio::{decode_ulaw, JitterBuffer};
 use crate::messages::{MediaOut, MediaOutSender};
+use crate::agc::Agc;
 use crate::{
     messages::{
         AudioCommand, AudioCommandReceiver, AudioMode,
@@ -59,6 +60,7 @@ pub struct AudioTask {
 
     // Talk side
     inject_tone_as_mic: bool,
+    agc: Agc,
     
     // Tone generator
     tone_phase: f32,
@@ -98,6 +100,7 @@ impl AudioTask {
             jitter: Jb::new(),
 
             inject_tone_as_mic: false,
+            agc: Agc::new(),
 
             tone_phase: 0.0,
         }
@@ -374,11 +377,14 @@ impl AudioTask {
         }
         self.engine = Engine::Talk { next: Some(deadline + FRAME_DURATION) };
 
-        let frame = if self.inject_tone_as_mic {
+        let mut frame = if self.inject_tone_as_mic {
             self.gen_tone_frame_8k()
         } else {
             self.capture_frame_8k_or_silence()
         };
+
+        let (gain_q12, rms) = self.agc.process_frame(frame.as_mut_slice());
+        log::info!("agc gain_q12={} rms={}", gain_q12, rms);
 
         // Best-effort send; if RTP task can't keep up, oh well.
         let _ = self.media_tx.send(MediaOut::PcmFrame(frame));

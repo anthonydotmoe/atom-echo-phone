@@ -15,6 +15,7 @@ use crate::tasks::{
     ui::UiTask,
 };
 
+mod agc;
 mod messages;
 mod settings;
 mod tasks;
